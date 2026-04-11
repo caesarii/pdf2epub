@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Shortcut: epub <pdf-file> [extra args...]
+# Example: ./epub ~/Downloads/monroe.pdf --auto-toc --title "My Book"
+cd "$(dirname "$0")" && uv run pdf2epub_paddle.py "$@"

@@ -337,18 +337,47 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
                 continue
 
 
-def download_image(url: str, save_path: str):
-    """Downloads an image from a URL to a local path."""
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            with open(save_path, "wb") as f:
-                f.write(response.content)
-            return True
-    except Exception as e:
-        print(f"[!] Failed to download image {url}: {e}")
+def download_image(url: str, save_path: str, max_retries: int = 3):
+    """Downloads an image from a URL to a local path with retry logic."""
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(response.content)
+                return True
+            else:
+                print(f"[!] Image download HTTP {response.status_code} (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)}")
+        except Exception as e:
+            print(f"[!] Image download failed (attempt {attempt + 1}/{max_retries}): {os.path.basename(save_path)} - {e}")
+        if attempt < max_retries - 1:
+            wait = 2 ** attempt * 2  # 2s, 4s, 8s
+            print(f"    Retrying in {wait}s...")
+            _time.sleep(wait)
+    print(f"[!] PERMANENT FAILURE downloading: {os.path.basename(save_path)}")
     return False
+
+
+def verify_all_images_downloaded(results: List[Dict], image_dir: str) -> tuple:
+    """Verifies all API-referenced images exist on disk.
+    Returns (total_count, missing_list) where missing_list contains
+    (rel_path, url) tuples for images that failed to download.
+    """
+    total = 0
+    missing = []
+    for result in results:
+        if not result or "result" not in result:
+            continue
+        for page_res in result["result"].get("layoutParsingResults", []):
+            images_map = page_res["markdown"].get("images", {})
+            for rel_path, img_url in images_map.items():
+                total += 1
+                local_path = os.path.join(image_dir, rel_path)
+                if not os.path.exists(local_path):
+                    missing.append((rel_path, img_url))
+    return total, missing
 
 
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
@@ -804,6 +833,32 @@ def main():
             if len(candidates) > len(filtered):
                 print(f"  ({len(filtered)} chapter headings found, {len(candidates) - len(filtered)} sub-headings hidden)")
             confirmed_headings = review_toc_interactive(filtered, all_candidates=candidates)
+
+        # Step 2.9: Verify all images downloaded
+        print("[-] Step 2.9: Verifying image downloads...")
+        total_imgs, missing_imgs = verify_all_images_downloaded(results, image_dir)
+        if missing_imgs:
+            print(f"[!] WARNING: {len(missing_imgs)}/{total_imgs} images failed to download.")
+            print("    Attempting re-download of missing images...")
+            still_missing = []
+            for rel_path, img_url in missing_imgs:
+                local_path = os.path.join(image_dir, rel_path)
+                if not download_image(img_url, local_path, max_retries=5):
+                    still_missing.append(rel_path)
+            if still_missing:
+                print(f"\n[!] FAILED to download {len(still_missing)} image(s):")
+                for p in still_missing:
+                    print(f"    - {p}")
+                proceed = input("\nProceed with EPUB generation anyway? [y/N]: ").strip().lower()
+                if proceed not in ("y", "yes"):
+                    print("[*] Aborted. Re-run the script to retry (cached chunks will be reused).")
+                    print("    NOTE: Image URLs expire. You may need to delete the chunk JSON")
+                    print(f"    files in '{work_dir}' and re-run to get fresh URLs.")
+                    sys.exit(1)
+            else:
+                print(f"    All {total_imgs} images now verified.")
+        else:
+            print(f"    All {total_imgs} images verified.")
 
         # Step 3: Generation
         print("[-] Step 3: Generating EPUB...")
