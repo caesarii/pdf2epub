@@ -1,28 +1,113 @@
 #!/usr/bin/env python3
 """
 两阶段扫描版 PDF 转 EPUB 工具
-支持逐步处理（默认每次5页），按需渲染截图。
+- ocr:   PDF → 分批 Markdown（发送截图给模型识别，供人工审核）
+- build: Markdown → EPUB
+
+OCR 优先使用 Zode 中转 Kimi（读取 ./output/.env 中的 key），保留 Claude 和外部回调作为兼容模式。
 """
 import os
 import sys
 import argparse
 import base64
 import glob
+import json
 import time
 
 import fitz
 from ebooklib import epub
+from dotenv import load_dotenv
 
-OCR_PROMPT = """识别页面所有文字，输出为 Markdown 格式。要求：
-1. 保持段落结构和层级
+load_dotenv()
+load_dotenv(os.path.join(os.getcwd(), "output", ".env"), override=False)
+
+import requests
+
+KIMI_ENDPOINT = "https://zode.qa.qima-inc.com/api/proxy/forward/chat/completions"
+KIMI_MODEL = "kimi-k2.5"
+
+OCR_PROMPT = """请仔细识别这张扫描页面的所有文字内容，输出为 Markdown 格式。要求：
+1. 保持原文的段落结构和层级关系
 2. 章节标题用 # ## ### 标记
 3. 表格用 Markdown 表格语法
-4. 公式保持原样
-5. 不输出页码
-6. 只输出文字，不要解释"""
+4. 公式保持原样输出
+5. 页码不输出
+6. 只输出识别到的文字，不要添加任何解释说明"""
+
+
+def _image_to_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("ascii")
+    ext = os.path.splitext(path)[1].lower()
+    media = {".png": "image/png", ".jpg": "image/jpeg",
+             ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext, "image/png")
+    return f"data:{media};base64,{img_b64}"
+
+
+def _extract_chat_content(data: dict) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Kimi 响应格式异常: {data}") from exc
+    if isinstance(content, list):
+        return "\n".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
+    return str(content).strip()
+
+
+def _extract_chat_content_from_sse(text: str) -> str:
+    chunks = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line.removeprefix("data:").strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        choice = (data.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        message = choice.get("message") or {}
+        content = delta.get("content") or message.get("content")
+        if content:
+            chunks.append(str(content))
+    return "".join(chunks).strip()
+
+
+def _kimi_ocr(image_paths: list[str], model: str = KIMI_MODEL) -> str:
+    """通过 Zode 中转调用 Kimi 识别图片中的文字。"""
+    zode_key = os.getenv("ZODE_KEY") or os.getenv("ZODE_API_KEY") or os.getenv("key")
+    if not zode_key:
+        raise RuntimeError("未找到 Zode Key，请在 ./output/.env 中配置 key=... 或设置 ZODE_KEY")
+
+    content = [{"type": "text", "text": OCR_PROMPT}]
+    for path in image_paths:
+        content.append({"type": "image_url", "image_url": {"url": _image_to_data_url(path)}})
+
+    response = requests.post(
+        KIMI_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {zode_key}",
+            "Content-Type": "application/json",
+        },
+        json={"model": model, "messages": [{"role": "user", "content": content}]},
+        timeout=180,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Kimi OCR 请求失败: HTTP {response.status_code} {response.text}")
+    try:
+        return _extract_chat_content(response.json())
+    except requests.JSONDecodeError:
+        content = _extract_chat_content_from_sse(response.text)
+        if content:
+            return content
+        raise RuntimeError(f"Kimi 响应格式异常: {response.text}")
 
 
 def _claude_ocr(image_paths: list[str], model: str) -> str:
+    """使用 Claude API 识别图片中的文字。"""
     import anthropic
     client = anthropic.Anthropic()
     content = [{"type": "text", "text": OCR_PROMPT}]
@@ -41,9 +126,13 @@ def _claude_ocr(image_paths: list[str], model: str) -> str:
     return resp.content[0].text
 
 
+# OCR 回调，由外部注入或内置模型使用
 OCR_CALLBACK = None
 
 def register_ocr_callback(fn):
+    """注册 OCR 回调。
+    fn 签名: fn(image_paths: list[str]) -> str
+    """
     global OCR_CALLBACK
     OCR_CALLBACK = fn
 
@@ -64,15 +153,22 @@ def render_pages_to_images(pdf_path: str, start: int, end: int, image_dir: str) 
 
 
 def ocr_pages(pdf_path: str, start: int, end: int, image_dir: str, model: str = None) -> str:
+    """渲染页面图片并发送给模型 OCR，返回 Markdown 文本。"""
     image_paths = render_pages_to_images(pdf_path, start, end, image_dir)
     if OCR_CALLBACK is not None:
         return OCR_CALLBACK(image_paths)
+
+    zode_key = os.getenv("ZODE_KEY") or os.getenv("ZODE_API_KEY") or os.getenv("key")
+    if zode_key:
+        return _kimi_ocr(image_paths, model=model or os.getenv("OCR_MODEL", KIMI_MODEL))
+
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if api_key:
         m = model or os.getenv("OCR_MODEL", "claude-sonnet-4-20250514")
         return _claude_ocr(image_paths, model=m)
-    print(f"    [!] 未注册 OCR 回调且未设置 ANTHROPIC_API_KEY")
-    return f"<!-- 未 OCR：第 {start+1}-{end} 页 -->\n"
+    print(f"    [!] 未注册 OCR 回调，且未设置 Zode Key 或 ANTHROPIC_API_KEY，页面图片已保存")
+    print(f"    [!] 请在 ./output/.env 中配置 key=...，或设置 ZODE_KEY / ANTHROPIC_API_KEY")
+    return f"<!-- 未 OCR：第 {start+1}-{end} 页，图片已保存 -->\n"
 
 
 def cmd_ocr(args):
@@ -192,7 +288,7 @@ def main():
     p_ocr.add_argument("--output-dir", default="./output")
     p_ocr.add_argument("--start", type=int, default=None, help="起始页（1-based）")
     p_ocr.add_argument("--end", type=int, default=None, help="结束页（1-based）")
-    p_ocr.add_argument("--model", default=None, help="OCR 模型")
+    p_ocr.add_argument("--model", default=None, help="OCR 模型（默认 kimi-k2.5）")
 
     p_build = sub.add_parser("build", help="Markdown → EPUB")
     p_build.add_argument("output_dir")

@@ -4,11 +4,16 @@
 
 支持**逐步处理**（默认每次5页），不需要一次处理完整本书。
 
+OCR 默认通过 Zode 中转调用 Kimi `kimi-k2.5`，Zode Key 从项目根目录 `./output/.env` 读取。
+
 ## 用法
 
 ```bash
+# 先配置 Zode Key（二选一，推荐 key，与现有 ./output/.env 兼容）
+echo 'key=zode_xxx' > ./output/.env
+
 # 逐步 OCR：每次处理5页，可分批执行
-python skills/skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> [--chunk-size 5] [--output-dir ./output]
+python skills/skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> [--chunk-size 5] [--output-dir ./output] [--model kimi-k2.5]
 
 # 指定范围处理（第21-50页）
 python skills/skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --start 21 --end 50
@@ -25,7 +30,26 @@ python skills/skilled-epub/scan_pdf_to_epub.py build <output_dir> [--title "书�
 
 ## OCR 模式
 
-### 内置 Claude API
+### 内置 Kimi OCR（默认）
+
+在 `./output/.env` 中配置任一变量即可：
+
+```bash
+key=zode_xxx
+# 或
+ZODE_KEY=zode_xxx
+```
+
+脚本会请求：
+
+```text
+POST https://zode.qa.qima-inc.com/api/proxy/forward/chat/completions
+model: kimi-k2.5
+```
+
+可通过 `--model` 参数或 `OCR_MODEL` 环境变量指定模型，默认 `kimi-k2.5`。
+
+### 内置 Claude API（后备）
 
 设置 `ANTHROPIC_API_KEY` 环境变量：
 
@@ -34,13 +58,18 @@ export ANTHROPIC_API_KEY=sk-ant-...
 python skills/skilled-epub/scan_pdf_to_epub.py ocr book.pdf
 ```
 
+只有未配置 Zode Key 时才会回退到 Claude。
+
 ### 外部回调（open-claw 集成）
 
 ```python
 from scan_pdf_to_epub import register_ocr_callback
 
 def my_ocr(image_paths: list[str]) -> str:
-    register_ocr_callback(my_ocr)
+    """接收页面截图路径列表，返回识别的 Markdown 文本。"""
+    ...
+
+register_ocr_callback(my_ocr)
 ```
 
 ## 输出目录结构
