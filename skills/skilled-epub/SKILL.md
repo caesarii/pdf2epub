@@ -12,21 +12,31 @@ OCR 默认通过 Zode 中转调用 Kimi `kimi-k2.5`，Zode Key 从项目根目�
 # 先配置 Zode Key（二选一，推荐 key，与现有 ./output/.env 兼容）
 echo 'key=zode_xxx' > ./output/.env
 
-# 逐步 OCR：每次处理5页，可分批执行
-python skills/skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> [--chunk-size 5] [--output-dir ./output] [--model kimi-k2.5]
+# 增量 OCR：缺少截图时会先自动截图，已存在的 md/page_XXXX.md 会自动跳过
+python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5
+python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --end 10
+python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5 --end 10
+python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --all
 
-# 指定范围处理（第21-50页）
-python skills/skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --start 21 --end 50
+# 增量截图：已存在的 page_XXXX.png 会自动跳过
+python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 1 --end 10
+python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 11
+python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --end 10
+python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --all
+
+# 单张图片 OCR：默认输出到 images 同级 md 目录
+python skilled-epub/scan_pdf_to_epub.py ocr-image output/书名/images/page_0005.png
 
 # 阶段二：Markdown → EPUB
-python skills/skilled-epub/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
+python skilled-epub/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
 ```
 
 ## 工作流
 
-1. `ocr` 命令：按需渲染页面截图，发给视觉模型识别文字，每批输出一个 `chunk_XX.md`
-2. 人工检查并编辑 `output_dir/*.md` 文件
-3. `build` 命令：将所有 `chunk_*.md` 按顺序合并打包为 EPUB
+1. `screenshot` 命令：按页渲染 PDF 截图到 `images/`，每次执行都会跳过已存在截图
+2. `ocr` 命令：逐页识别截图为 `md/page_XXXX.md`，缺少截图时会先自动截图，已存在 Markdown 会跳过
+3. 人工检查并编辑 `output_dir/md/*.md` 文件
+4. `build` 命令：将所有 `md/page_*.md` 按顺序合并打包为 EPUB
 
 ## OCR 模式
 
@@ -55,7 +65,7 @@ model: kimi-k2.5
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python skills/skilled-epub/scan_pdf_to_epub.py ocr book.pdf
+python skilled-epub/scan_pdf_to_epub.py ocr book.pdf
 ```
 
 只有未配置 Zode Key 时才会回退到 Claude。
@@ -76,10 +86,12 @@ register_ocr_callback(my_ocr)
 
 ```
 output_dir/
-  chunk_00.md          # 第1-5页 OCR 结果
-  chunk_01.md          # 第6-10页 OCR 结果
   images/
     page_0001.png      # 按需渲染的截图
+    ...
+  md/
+    page_0001.md       # 单页 OCR 结果
+    page_0002.md
     ...
   cover.png
 ```

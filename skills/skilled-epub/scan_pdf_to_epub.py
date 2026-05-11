@@ -50,8 +50,14 @@ def _extract_chat_content(data: dict) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"Kimi 响应格式异常: {data}") from exc
     if isinstance(content, list):
-        return "\n".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
-    return str(content).strip()
+        text = "\n".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
+    else:
+        text = str(content).strip()
+    # Zode proxy 返回的 UTF-8 中文字符串被错误编码为 latin-1，需要转回
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
 
 
 def _extract_chat_content_from_sse(text: str) -> str:
@@ -97,13 +103,15 @@ def _kimi_ocr(image_paths: list[str], model: str = KIMI_MODEL) -> str:
     )
     if response.status_code >= 400:
         raise RuntimeError(f"Kimi OCR 请求失败: HTTP {response.status_code} {response.text}")
+    response.encoding = "utf-8"
     try:
         return _extract_chat_content(response.json())
     except requests.JSONDecodeError:
-        content = _extract_chat_content_from_sse(response.text)
+        # SSE 流式响应：用原始字节 UTF-8 解码，避免 requests 的自动编码检测错误
+        content = _extract_chat_content_from_sse(response.content.decode("utf-8"))
         if content:
             return content
-        raise RuntimeError(f"Kimi 响应格式异常: {response.text}")
+        raise RuntimeError(f"Kimi 响应格式异常: {response.text[:500]}")
 
 
 def _claude_ocr(image_paths: list[str], model: str) -> str:
@@ -147,81 +155,120 @@ def render_pages_to_images(pdf_path: str, start: int, end: int, image_dir: str) 
             page = doc.load_page(page_num)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             pix.save(path)
+            print(f"[+] 已截图: {path}")
+        else:
+            print(f"[+] 跳过（已存在）: {path}")
         paths.append(path)
     doc.close()
     return paths
 
 
-def ocr_pages(pdf_path: str, start: int, end: int, image_dir: str, model: str = None) -> str:
-    """渲染页面图片并发送给模型 OCR，返回 Markdown 文本。"""
-    image_paths = render_pages_to_images(pdf_path, start, end, image_dir)
-    if OCR_CALLBACK is not None:
-        return OCR_CALLBACK(image_paths)
+def _get_pdf_total_pages(pdf_path: str) -> int:
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    doc.close()
+    return total
 
-    zode_key = os.getenv("ZODE_KEY") or os.getenv("ZODE_API_KEY") or os.getenv("key")
-    if zode_key:
-        return _kimi_ocr(image_paths, model=model or os.getenv("OCR_MODEL", KIMI_MODEL))
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if api_key:
-        m = model or os.getenv("OCR_MODEL", "claude-sonnet-4-20250514")
-        return _claude_ocr(image_paths, model=m)
-    print(f"    [!] 未注册 OCR 回调，且未设置 Zode Key 或 ANTHROPIC_API_KEY，页面图片已保存")
-    print(f"    [!] 请在 ./output/.env 中配置 key=...，或设置 ZODE_KEY / ANTHROPIC_API_KEY")
-    return f"<!-- 未 OCR：第 {start+1}-{end} 页，图片已保存 -->\n"
+def _resolve_screenshot_range(total: int, start_page: int | None, end_page: int | None, all_pages: bool) -> tuple[int, int]:
+    if all_pages and (start_page is not None or end_page is not None):
+        raise ValueError("--all 不能和 --start / --end 同时使用")
+
+    start = 0 if all_pages or start_page is None else start_page - 1
+    if start < 0:
+        start = 0
+    if start >= total:
+        raise ValueError(f"起始页超出范围：PDF 共 {total} 页")
+
+    if all_pages:
+        end = total
+    elif end_page is not None:
+        end = end_page
+    else:
+        end = start + 1
+
+    if end > total:
+        end = total
+    if end <= start:
+        raise ValueError(f"结束页必须大于等于起始页：start={start + 1}, end={end}")
+    return start, end
+
+
+def default_md_path_for_image(image_path: str) -> str:
+    image_dir = os.path.dirname(image_path)
+    output_dir = os.path.dirname(image_dir)
+    md_dir = os.path.join(output_dir, "md")
+    base = os.path.splitext(os.path.basename(image_path))[0] + ".md"
+    return os.path.join(md_dir, base)
+
+
+def cmd_ocr_image(args):
+    ocr_image_to_md(args.image, args.output, model=args.model)
+
+
+def ocr_image_to_md(image_path: str, output: str | None = None, model: str | None = None) -> str:
+    output = output or default_md_path_for_image(image_path)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    md_text = _kimi_ocr([image_path], model=model or os.getenv("OCR_MODEL", KIMI_MODEL))
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(md_text)
+        if not md_text.endswith("\n"):
+            f.write("\n")
+    print(f"[+] 已输出: {output}")
+    return output
+
+
+def cmd_screenshot(args):
+    output_dir = args.output_dir or os.path.splitext(os.path.basename(args.input_pdf))[0]
+    image_dir = os.path.join(output_dir, "images")
+    total = _get_pdf_total_pages(args.input_pdf)
+    try:
+        start, end = _resolve_screenshot_range(total, args.start, args.end, args.all)
+    except ValueError as exc:
+        print(f"[!] {exc}")
+        sys.exit(1)
+
+    print(f"[*] PDF 共 {total} 页，本次截图第 {start + 1}-{end} 页")
+    render_pages_to_images(args.input_pdf, start, end, image_dir)
+    print(f"[*] 截图完成: {image_dir}")
 
 
 def cmd_ocr(args):
-    os.makedirs(args.output_dir, exist_ok=True)
-    image_dir = os.path.join(args.output_dir, "images")
+    output_dir = args.output_dir or os.path.splitext(os.path.basename(args.input_pdf))[0]
+    os.makedirs(output_dir, exist_ok=True)
+    image_dir = os.path.join(output_dir, "images")
+    md_dir = os.path.join(output_dir, "md")
     os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(md_dir, exist_ok=True)
 
-    doc = fitz.open(args.input_pdf)
-    total = len(doc)
-    doc.close()
+    total = _get_pdf_total_pages(args.input_pdf)
+    try:
+        start, end = _resolve_screenshot_range(total, args.start, args.end, args.all)
+    except ValueError as exc:
+        print(f"[!] {exc}")
+        sys.exit(1)
 
-    start = (args.start or 1) - 1  # 转为 0-based
-    end = args.end or total
-    if start < 0: start = 0
-    if end > total: end = total
+    print(f"[*] PDF 共 {total} 页，本次 OCR 第 {start + 1}-{end} 页")
 
-    chunk_size = args.chunk_size
-    num_chunks = ((end - start) + chunk_size - 1) // chunk_size
-    print(f"[*] PDF 共 {total} 页，本次处理第 {start+1}-{end} 页，分 {num_chunks} 批（每批 {chunk_size} 页）")
-
-    # 封面
-    cover_path = os.path.join(args.output_dir, "cover.png")
-    if not os.path.exists(cover_path):
-        paths = render_pages_to_images(args.input_pdf, 0, 1, image_dir)
-        if paths and os.path.exists(paths[0]):
-            import shutil
-            shutil.copy2(paths[0], cover_path)
-            print(f"[*] 封面已保存")
-
-    for i in range(num_chunks):
-        s = start + i * chunk_size
-        e = min(s + chunk_size, end)
-        idx = s // chunk_size  # chunk 序号由页码决定
-        md_path = os.path.join(args.output_dir, f"chunk_{idx:02d}.md")
-
+    for page_num in range(start, end):
+        image_path = os.path.join(image_dir, f"page_{page_num + 1:04d}.png")
+        md_path = os.path.join(md_dir, f"page_{page_num + 1:04d}.md")
         if os.path.exists(md_path):
-            print(f"[+] 跳过（已存在）: chunk_{idx:02d}.md")
+            print(f"[+] 跳过（已存在）: {md_path}")
             continue
+        if not os.path.exists(image_path):
+            print(f"[-] 缺少截图，先生成第 {page_num + 1} 页截图...")
+            render_pages_to_images(args.input_pdf, page_num, page_num + 1, image_dir)
+        print(f"[-] OCR 第 {page_num + 1} 页...")
+        ocr_image_to_md(image_path, md_path, model=args.model)
 
-        print(f"[-] 处理第 {i+1}/{num_chunks} 批（第 {s+1}-{e} 页）...")
-        md_text = ocr_pages(args.input_pdf, s, e, image_dir, model=args.model)
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(f"<!-- 第 {s+1}-{e} 页 -->\n\n")
-            f.write(md_text)
-        print(f"[+] 已输出: chunk_{idx:02d}.md")
-
-    print(f"\n[*] 本次处理完成。请检查 {args.output_dir}/*.md，然后运行 build 命令。")
+    print(f"\n[*] 本次 OCR 完成。请检查 {md_dir}/*.md，然后运行 build 命令。")
 
 
 def cmd_build(args):
-    md_files = sorted(glob.glob(os.path.join(args.output_dir, "chunk_*.md")))
+    md_files = sorted(glob.glob(os.path.join(args.output_dir, "md", "page_*.md")))
     if not md_files:
-        print(f"[!] 未找到 chunk_*.md 文件")
+        print(f"[!] 未找到 md/page_*.md 文件")
         sys.exit(1)
 
     full_md = ""
@@ -282,13 +329,25 @@ def main():
     parser = argparse.ArgumentParser(description="扫描版 PDF 转 EPUB（两阶段）")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_ocr = sub.add_parser("ocr", help="PDF → Markdown（逐步处理）")
+    p_ocr = sub.add_parser("ocr", help="PDF 页面 → Markdown（增量）")
     p_ocr.add_argument("input_pdf")
-    p_ocr.add_argument("--chunk-size", type=int, default=5)
-    p_ocr.add_argument("--output-dir", default="./output")
-    p_ocr.add_argument("--start", type=int, default=None, help="起始页（1-based）")
-    p_ocr.add_argument("--end", type=int, default=None, help="结束页（1-based）")
+    p_ocr.add_argument("--output-dir", default=None, help="输出目录（默认使用 PDF 文件名）")
+    p_ocr.add_argument("--start", type=int, default=None, help="起始页（1-based；不指定 --end 时只 OCR 该页）")
+    p_ocr.add_argument("--end", type=int, default=None, help="结束页（1-based；不指定 --start 时从第一页 OCR 到该页）")
+    p_ocr.add_argument("--all", action="store_true", help="OCR 所有页面，不能和 --start / --end 同时使用")
     p_ocr.add_argument("--model", default=None, help="OCR 模型（默认 kimi-k2.5）")
+
+    p_ocr_image = sub.add_parser("ocr-image", help="单张图片 → Markdown")
+    p_ocr_image.add_argument("image")
+    p_ocr_image.add_argument("--output", "-o", default=None, help="输出 Markdown 路径（默认 images 同级 md 目录）")
+    p_ocr_image.add_argument("--model", default=None, help="OCR 模型（默认 kimi-k2.5）")
+
+    p_screenshot = sub.add_parser("screenshot", help="PDF → 页面截图（增量）")
+    p_screenshot.add_argument("input_pdf")
+    p_screenshot.add_argument("--output-dir", default=None, help="输出目录（默认使用 PDF 文件名）")
+    p_screenshot.add_argument("--start", type=int, default=None, help="起始页（1-based；不指定 --end 时只截图该页）")
+    p_screenshot.add_argument("--end", type=int, default=None, help="结束页（1-based；不指定 --start 时从第一页截图到该页）")
+    p_screenshot.add_argument("--all", action="store_true", help="截图所有页面，不能和 --start / --end 同时使用")
 
     p_build = sub.add_parser("build", help="Markdown → EPUB")
     p_build.add_argument("output_dir")
@@ -299,6 +358,10 @@ def main():
     args = parser.parse_args()
     if args.cmd == "ocr":
         cmd_ocr(args)
+    elif args.cmd == "ocr-image":
+        cmd_ocr_image(args)
+    elif args.cmd == "screenshot":
+        cmd_screenshot(args)
     else:
         cmd_build(args)
 
