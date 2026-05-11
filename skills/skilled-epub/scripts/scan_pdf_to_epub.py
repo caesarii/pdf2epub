@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-两阶段扫描版 PDF 转 EPUB 工具
-- ocr:   PDF → 分批 Markdown（发送截图给模型识别，供人工审核）
-- build: Markdown → EPUB
+扫描版 PDF 转 EPUB 工具
+- screenshot: PDF 页面 → PNG 截图（增量）
+- ocr:        PDF 页面截图 → 逐页 Markdown（增量，缺截图时自动补图）
+- ocr-image:  单张图片 → Markdown
+- build:      Markdown → EPUB
 
 OCR 优先使用 Zode 中转 Kimi（读取 ./output/.env 中的 key），保留 Claude 和外部回调作为兼容模式。
 """

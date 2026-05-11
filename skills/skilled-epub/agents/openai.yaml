@@ -1,0 +1,3 @@
+display_name: Skilled EPUB
+short_description: Incrementally convert scanned PDFs to EPUB with screenshots and Kimi OCR.
+default_prompt: Convert a scanned PDF to EPUB using the incremental screenshot, OCR, review, and build workflow.

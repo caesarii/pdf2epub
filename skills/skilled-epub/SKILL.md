@@ -1,8 +1,11 @@
-# skilled-epub
+---
+name: skilled-epub
+description: Use when converting scanned PDFs to EPUB through an incremental workflow: render PDF pages to screenshots, OCR screenshots to per-page Markdown with Kimi via Zode, review Markdown, and build EPUB output. Also use for single-page screenshot/OCR operations in this repository.
+---
 
-扫描版 PDF 转 EPUB 的两阶段工作流：先批量截图发给视觉模型 OCR 输出 Markdown 中间产物供人工审核，再打包为 EPUB。
+# Skilled EPUB
 
-支持**逐步处理**（默认每次5页），不需要一次处理完整本书。
+扫描版 PDF 转 EPUB 的增量工作流：截图 PDF 页面、用 Kimi OCR 为逐页 Markdown、人工审核后打包 EPUB。
 
 OCR 默认通过 Zode 中转调用 Kimi `kimi-k2.5`，Zode Key 从项目根目录 `./output/.env` 读取。
 
@@ -13,22 +16,22 @@ OCR 默认通过 Zode 中转调用 Kimi `kimi-k2.5`，Zode Key 从项目根目�
 echo 'key=zode_xxx' > ./output/.env
 
 # 增量 OCR：缺少截图时会先自动截图，已存在的 md/page_XXXX.md 会自动跳过
-python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5
-python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --end 10
-python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5 --end 10
-python skilled-epub/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --all
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --end 10
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --start 5 --end 10
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr <input.pdf> --output-dir output/书名 --all
 
 # 增量截图：已存在的 page_XXXX.png 会自动跳过
-python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 1 --end 10
-python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 11
-python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --end 10
-python skilled-epub/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --all
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 1 --end 10
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --start 11
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --end 10
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py screenshot <input.pdf> --output-dir output/书名 --all
 
 # 单张图片 OCR：默认输出到 images 同级 md 目录
-python skilled-epub/scan_pdf_to_epub.py ocr-image output/书名/images/page_0005.png
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr-image output/书名/images/page_0005.png
 
 # 阶段二：Markdown → EPUB
-python skilled-epub/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
 ```
 
 ## 工作流
@@ -65,7 +68,7 @@ model: kimi-k2.5
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python skilled-epub/scan_pdf_to_epub.py ocr book.pdf
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr book.pdf
 ```
 
 只有未配置 Zode Key 时才会回退到 Claude。
