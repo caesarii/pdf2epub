@@ -61,7 +61,7 @@ def _extract_chat_content(data: dict) -> str:
 
 
 def _extract_chat_content_from_sse(text: str) -> str:
-    chunks = []
+    parts = []
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -78,8 +78,8 @@ def _extract_chat_content_from_sse(text: str) -> str:
         message = choice.get("message") or {}
         content = delta.get("content") or message.get("content")
         if content:
-            chunks.append(str(content))
-    return "".join(chunks).strip()
+            parts.append(str(content))
+    return "".join(parts).strip()
 
 
 def _kimi_ocr(image_paths: list[str], model: str = KIMI_MODEL) -> str:
