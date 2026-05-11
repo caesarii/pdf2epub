@@ -13,7 +13,9 @@ import sys
 import argparse
 import base64
 import glob
+import html
 import json
+import re
 import time
 
 import fitz
@@ -267,21 +269,120 @@ def cmd_ocr(args):
     print(f"\n[*] 本次 OCR 完成。请检查 {md_dir}/*.md，然后运行 build 命令。")
 
 
+def _md_files(output_dir: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(output_dir, "md", "page_*.md")))
+
+
+def _page_number_from_md(path: str) -> int:
+    return int(os.path.splitext(os.path.basename(path))[0].split("_")[1])
+
+
+def _clean_heading(line: str) -> tuple[int, str] | None:
+    match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+    if not match:
+        return None
+    title = match.group(2).strip().strip("*_` ")
+    return len(match.group(1)), title
+
+
+def _is_router_title(title: str) -> bool:
+    title = title.strip()
+    if re.search(r"\s\d{1,3}$", title):
+        return False
+    if re.fullmatch(r"附录\s*\d+", title):
+        return False
+    patterns = [
+        r"^推荐序$",
+        r"^中文版序$",
+        r"^序言$",
+        r"^第\s*\d+\s*章\b",
+        r"^附录\s*\d+\b",
+        r"^译后记$",
+    ]
+    return any(re.search(pattern, title) for pattern in patterns)
+
+
+def generate_router(output_dir: str) -> list[dict]:
+    entries = []
+    seen_titles = set()
+    seen_keys = set()
+    for path in _md_files(output_dir):
+        page = _page_number_from_md(path)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+            if any((line.strip().lstrip("# ").strip().startswith("目录") for line in lines[:3])):
+                continue
+            for line_index, line in enumerate(lines):
+                heading = _clean_heading(line)
+                if not heading:
+                    continue
+                level, title = heading
+                if not _is_router_title(title):
+                    continue
+                key = re.sub(r"\s+", "", title.replace("｜", "|").replace(" ", ""))
+                # 同名或 OCR 空格差异标题只保留正文首次出现的位置。
+                if title in seen_titles or key in seen_keys:
+                    continue
+                seen_titles.add(title)
+                seen_keys.add(key)
+                entries.append({
+                    "title": title,
+                    "page": page,
+                    "line": line_index,
+                    "level": min(level, 2),
+                    "anchor": f"route-{len(entries) + 1:03d}",
+                })
+    return entries
+
+
+def router_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "router.json")
+
+
+def load_router(output_dir: str) -> list[dict]:
+    path = router_path(output_dir)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cmd_router(args):
+    entries = generate_router(args.output_dir)
+    output = args.output or router_path(args.output_dir)
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    print(f"[+] 已生成目录: {output}")
+    for entry in entries:
+        print(f"    p{entry['page']:04d} {entry['title']} -> #{entry['anchor']}")
+
+
 def cmd_build(args):
-    md_files = sorted(glob.glob(os.path.join(args.output_dir, "md", "page_*.md")))
+    md_files = _md_files(args.output_dir)
     if not md_files:
         print(f"[!] 未找到 md/page_*.md 文件")
         sys.exit(1)
 
+    routes = load_router(args.output_dir)
+    route_by_source = {(entry["page"], entry["line"]): entry for entry in routes}
     full_md = ""
     for path in md_files:
+        page = _page_number_from_md(path)
         with open(path, encoding="utf-8") as f:
-            content = f.read()
-        content = "\n".join(l for l in content.splitlines() if not l.startswith("<!--"))
+            lines = f.read().splitlines()
+        content_lines = []
+        for line_index, line in enumerate(lines):
+            if line.startswith("<!--"):
+                continue
+            route = route_by_source.get((page, line_index))
+            if route:
+                content_lines.append(f'<a id="{route["anchor"]}"></a>')
+            content_lines.append(line)
+        content = "\n".join(content_lines)
         full_md += content.strip() + "\n\n"
 
     title = args.title or os.path.basename(args.output_dir)
-    image_dir = os.path.join(args.output_dir, "images")
     cover_path = os.path.join(args.output_dir, "cover.png")
 
     book = epub.EpubBook()
@@ -295,29 +396,15 @@ def cmd_build(args):
         with open(cover_path, "rb") as f:
             book.set_cover("cover.png", f.read())
 
-    if os.path.isdir(image_dir):
-        for root, _, files in os.walk(image_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                rel = os.path.relpath(fpath, image_dir)
-                epub_path = "images/" + rel.replace("\\", "/")
-                ext = os.path.splitext(fname)[1].lower()
-                mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                        ".png": "image/png", ".gif": "image/gif",
-                        ".webp": "image/webp"}.get(ext, "image/jpeg")
-                with open(fpath, "rb") as f:
-                    img = epub.EpubImage()
-                    img.file_name = epub_path
-                    img.media_type = mime
-                    img.content = f.read()
-                    book.add_item(img)
-
     import markdown as md_lib
     html_content = md_lib.markdown(full_md, extensions=["tables", "fenced_code"])
     chapter = epub.EpubHtml(title=title, file_name="content.xhtml", lang="zh")
     chapter.content = f"<html><body>{html_content}</body></html>"
     book.add_item(chapter)
-    book.toc = [epub.Link("content.xhtml", title, "content")]
+    if routes:
+        book.toc = [epub.Link(f"content.xhtml#{entry['anchor']}", entry["title"], entry["anchor"]) for entry in routes]
+    else:
+        book.toc = [epub.Link("content.xhtml", title, "content")]
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = ["nav", chapter]
@@ -325,6 +412,57 @@ def cmd_build(args):
     output = args.output or os.path.join(args.output_dir, f"{title}.epub")
     epub.write_epub(output, book)
     print(f"[+] EPUB 已生成: {output}")
+
+
+def cmd_preview(args):
+    unpacked_dir = args.unpacked_dir
+    epub_dir = os.path.join(unpacked_dir, "EPUB")
+    content_path = os.path.join(epub_dir, "content.xhtml")
+    nav_path = os.path.join(epub_dir, "nav.xhtml")
+    if not os.path.exists(content_path):
+        print(f"[!] 未找到 EPUB/content.xhtml: {content_path}")
+        sys.exit(1)
+    if not os.path.exists(nav_path):
+        print(f"[!] 未找到 EPUB/nav.xhtml: {nav_path}")
+        sys.exit(1)
+
+    title = args.title or os.path.basename(os.path.abspath(unpacked_dir))
+    output = args.output or os.path.join(unpacked_dir, "index.html")
+    with open(nav_path, encoding="utf-8") as f:
+        nav_html = f.read()
+    toc_match = re.search(r"<ol>.*</ol>", nav_html, flags=re.S)
+    toc_html = toc_match.group(0) if toc_match else "<ol><li><a href=\"content.xhtml\">正文</a></li></ol>"
+    toc_html = toc_html.replace('href="content.xhtml', 'href="EPUB/content.xhtml')
+    toc_html = re.sub(r"<a ", '<a target="book" ', toc_html)
+    preview_html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(title)}</title>
+  <style>
+    html, body {{ margin: 0; height: 100%; font-family: Georgia, 'Songti SC', serif; }}
+    body {{ display: grid; grid-template-columns: 300px 1fr; background: #f7f3eb; }}
+    nav {{ overflow: auto; padding: 24px 20px; border-right: 1px solid #ddd3c2; background: #fffaf0; }}
+    nav h1 {{ margin: 0 0 18px; font-size: 20px; }}
+    nav ol {{ padding-left: 22px; line-height: 1.8; }}
+    nav a {{ color: #4b3522; text-decoration: none; }}
+    nav a:hover {{ text-decoration: underline; }}
+    iframe {{ width: 100%; height: 100vh; border: 0; background: white; }}
+  </style>
+</head>
+<body>
+  <nav>
+    <h1>{html.escape(title)}</h1>
+    <p><a href="EPUB/content.xhtml" target="book">打开正文开头</a></p>
+    {toc_html}
+  </nav>
+  <iframe name="book" src="EPUB/content.xhtml" title="正文"></iframe>
+</body>
+</html>
+"""
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(preview_html)
+    print(f"[+] 预览页已生成: {output}")
 
 
 def main():
@@ -357,6 +495,15 @@ def main():
     p_build.add_argument("--author")
     p_build.add_argument("--output", "-o")
 
+    p_router = sub.add_parser("router", help="生成 EPUB 可导航目录 router.json")
+    p_router.add_argument("output_dir")
+    p_router.add_argument("--output", "-o", default=None)
+
+    p_preview = sub.add_parser("preview", help="为 EPUB 解包目录生成浏览器预览页")
+    p_preview.add_argument("unpacked_dir")
+    p_preview.add_argument("--title", default=None)
+    p_preview.add_argument("--output", "-o", default=None)
+
     args = parser.parse_args()
     if args.cmd == "ocr":
         cmd_ocr(args)
@@ -364,6 +511,10 @@ def main():
         cmd_ocr_image(args)
     elif args.cmd == "screenshot":
         cmd_screenshot(args)
+    elif args.cmd == "router":
+        cmd_router(args)
+    elif args.cmd == "preview":
+        cmd_preview(args)
     else:
         cmd_build(args)
 
