@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+两阶段扫描版 PDF 转 EPUB 工具
+- ocr:   PDF → 分批 Markdown（发送截图给模型识别，供人工审核）
+- build: Markdown → EPUB
+
+OCR 支持两种模式：
+1. 内置 Claude API OCR（设置 ANTHROPIC_API_KEY 环境变量）
+2. 外部回调（register_ocr_callback），由 open-claw 等框架注入
+"""
+import os
+import sys
+import argparse
+import base64
+import glob
+import json
+import time
+
+import fitz
+from ebooklib import epub
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OCR_PROMPT = """请仔细识别这张扫描页面的所有文字内容，输出为 Markdown 格式。要求：
+1. 保持原文的段落结构和层级关系
+2. 章节标题用 # ## ### 标记
+3. 表格用 Markdown 表格语法
+4. 公式保持原样输出
+5. 页码不输出
+6. 只输出识别到的文字，不要添加任何解释说明"""
+
+
+def _claude_ocr(image_paths: list[str], model: str = "claude-sonnet-4-20250514") -> str:
+    """使用 Claude API 识别图片中的文字。"""
+    import anthropic
+
+    client = anthropic.Anthropic()
+    content = [{"type": "text", "text": OCR_PROMPT}]
+
+    for path in image_paths:
+        with open(path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("ascii")
+        ext = os.path.splitext(path)[1].lower()
+        media = {".png": "image/png", ".jpg": "image/jpeg",
+                 ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext, "image/png")
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media, "data": img_b64},
+        })
+
+    resp = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": content}],
+    )
+    return resp.content[0].text
+
+
+# OCR 回调，由外部注入或内置 Claude API
+OCR_CALLBACK = None
+
+
+def register_ocr_callback(fn):
+    """注册 OCR 回调。
+    fn 签名: fn(image_paths: list[str]) -> str
+    """
+    global OCR_CALLBACK
+    OCR_CALLBACK = fn
+
+
+def render_pages_to_images(pdf_path: str, start: int, end: int, image_dir: str) -> list[str]:
+    """将 PDF 指定页范围渲染为 PNG 图片，返回图片路径列表。"""
+    doc = fitz.open(pdf_path)
+    paths = []
+    for page_num in range(start, end):
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x 缩放提升清晰度
+        path = os.path.join(image_dir, f"page_{page_num + 1:04d}.png")
+        pix.save(path)
+        paths.append(path)
+    doc.close()
+    return paths
+
+
+def ocr_pages(pdf_path: str, start: int, end: int, image_dir: str, model: str = None) -> str:
+    """渲染页面图片并发送给模型 OCR，返回 Markdown 文本。"""
+    image_paths = render_pages_to_images(pdf_path, start, end, image_dir)
+
+    if OCR_CALLBACK is not None:
+        return OCR_CALLBACK(image_paths)
+
+    # 内置 Claude API OCR
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if api_key:
+        m = model or os.getenv("OCR_MODEL", "claude-sonnet-4-20250514")
+        return _claude_ocr(image_paths, model=m)
+
+    # fallback
+    print(f"    [!] 未注册 OCR 回调且未设置 ANTHROPIC_API_KEY，页面图片已保存")
+    print(f"    [!] 请设置 ANTHROPIC_API_KEY 或注册 OCR_CALLBACK")
+    return f"<!-- 未 OCR：第 {start+1}-{end} 页，图片已保存 -->\n"
+
+
+def cmd_ocr(args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    image_dir = os.path.join(args.output_dir, "images")
+    os.makedirs(image_dir, exist_ok=True)
+
+    doc = fitz.open(args.input_pdf)
+    total = len(doc)
+    doc.close()
+
+    num_chunks = (total + args.chunk_size - 1) // args.chunk_size
+    print(f"[*] 共 {total} 页，分为 {num_chunks} 批（每批 {args.chunk_size} 页）")
+
+    # 提取封面
+    cover_path = os.path.join(args.output_dir, "cover.png")
+    if not os.path.exists(cover_path):
+        paths = render_pages_to_images(args.input_pdf, 0, 1, image_dir)
+        if paths and os.path.exists(paths[0]):
+            import shutil
+            shutil.copy2(paths[0], cover_path)
+            print(f"[*] 封面已保存: {cover_path}")
+
+    for i in range(num_chunks):
+        start = i * args.chunk_size
+        end = min(start + args.chunk_size, total)
+        md_path = os.path.join(args.output_dir, f"chunk_{i:02d}.md")
+
+        if os.path.exists(md_path):
+            print(f"[+] 跳过（已存在）: {md_path}")
+            continue
+
+        print(f"[-] 处理第 {i+1}/{num_chunks} 批（第 {start+1}-{end} 页）...")
+
+        md_text = ocr_pages(args.input_pdf, start, end, image_dir, model=args.model)
+
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(f"<!-- 第 {start+1}-{end} 页 -->\n\n")
+            f.write(md_text)
+        print(f"[+] 已输出: {md_path}")
+
+    print(f"\n[*] OCR 完成。请检查 {args.output_dir}/*.md，然后运行 build 命令生成 EPUB。")
+
+
+def cmd_build(args):
+    md_files = sorted(glob.glob(os.path.join(args.output_dir, "chunk_*.md")))
+    if not md_files:
+        print(f"[!] 未找到 {args.output_dir}/chunk_*.md 文件")
+        sys.exit(1)
+
+    full_md = ""
+    for path in md_files:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        content = "\n".join(l for l in content.splitlines() if not l.startswith("<!--"))
+        full_md += content.strip() + "\n\n"
+
+    title = args.title or os.path.basename(args.output_dir)
+    image_dir = os.path.join(args.output_dir, "images")
+    cover_path = os.path.join(args.output_dir, "cover.png")
+
+    book = epub.EpubBook()
+    book.set_identifier(f"id_{title}")
+    book.set_title(title)
+    book.set_language("zh")
+    if args.author:
+        book.add_author(args.author)
+
+    if os.path.exists(cover_path):
+        with open(cover_path, "rb") as f:
+            book.set_cover("cover.png", f.read())
+
+    # 嵌入图片
+    if os.path.isdir(image_dir):
+        for root, _, files in os.walk(image_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, image_dir)
+                epub_path = "images/" + rel.replace("\\", "/")
+                ext = os.path.splitext(fname)[1].lower()
+                mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                        ".png": "image/png", ".gif": "image/gif",
+                        ".webp": "image/webp"}.get(ext, "image/jpeg")
+                with open(fpath, "rb") as f:
+                    img = epub.EpubImage()
+                    img.file_name = epub_path
+                    img.media_type = mime
+                    img.content = f.read()
+                    book.add_item(img)
+
+    import markdown as md_lib
+    html_content = md_lib.markdown(full_md, extensions=["tables", "fenced_code"])
+
+    chapter = epub.EpubHtml(title=title, file_name="content.xhtml", lang="zh")
+    chapter.content = f"<html><body>{html_content}</body></html>"
+    book.add_item(chapter)
+    book.toc = [epub.Link("content.xhtml", title, "content")]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", chapter]
+
+    output = args.output or os.path.join(args.output_dir, f"{title}.epub")
+    epub.write_epub(output, book)
+    print(f"[+] EPUB 已生成: {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="扫描版 PDF 转 EPUB（两阶段）")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_ocr = sub.add_parser("ocr", help="PDF → Markdown（OCR 阶段）")
+    p_ocr.add_argument("input_pdf")
+    p_ocr.add_argument("--chunk-size", type=int, default=5)
+    p_ocr.add_argument("--output-dir", default="./output")
+    p_ocr.add_argument("--model", default=None, help="OCR 模型（默认 claude-sonnet-4-20250514）")
+
+    p_build = sub.add_parser("build", help="Markdown → EPUB（打包阶段）")
+    p_build.add_argument("output_dir")
+    p_build.add_argument("--title")
+    p_build.add_argument("--author")
+    p_build.add_argument("--output", "-o")
+
+    args = parser.parse_args()
+    if args.cmd == "ocr":
+        cmd_ocr(args)
+    else:
+        cmd_build(args)
+
+
+if __name__ == "__main__":
+    main()

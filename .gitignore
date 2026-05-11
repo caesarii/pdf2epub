@@ -28,3 +28,5 @@ paddle_epub_work_*/
 debug_api_error.json
 debug_last_response.json
 .env
+output/
+input/
