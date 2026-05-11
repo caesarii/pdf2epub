@@ -31,9 +31,7 @@ python skills/skilled-epub/scripts/scan_pdf_to_epub.py screenshot <input.pdf> --
 python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr-image output/书名/images/page_0005.png
 
 # 阶段二：Markdown → EPUB
-python skills/skilled-epub/scripts/scan_pdf_to_epub.py router <output_dir>
 python skills/skilled-epub/scripts/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
-python skills/skilled-epub/scripts/scan_pdf_to_epub.py preview <epub_unpacked_dir> [--title "书名"]
 ```
 
 ## 工作流
@@ -41,9 +39,7 @@ python skills/skilled-epub/scripts/scan_pdf_to_epub.py preview <epub_unpacked_di
 1. `screenshot` 命令：按页渲染 PDF 截图到 `images/`，每次执行都会跳过已存在截图
 2. `ocr` 命令：逐页识别截图为 `md/page_XXXX.md`，缺少截图时会先自动截图，已存在 Markdown 会跳过
 3. 人工检查并编辑 `output_dir/md/*.md` 文件
-4. `router` 命令：生成 `router.json`，用于 EPUB 阅读器里的可导航目录
-5. `build` 命令：将所有 `md/page_*.md` 按顺序合并打包为 EPUB；存在 `router.json` 时会生成 EPUB 导航目录
-6. `preview` 命令：为 EPUB 解包目录生成 `index.html`，可在浏览器中本地预览，尽量复用 EPUB 原始 `content.xhtml` 和 `nav.xhtml`
+4. `build` 命令：生成 `router.json`，并将所有 `md/page_*.md` 按顺序合并打包为带导航目录的 EPUB
 
 ## OCR 模式
 

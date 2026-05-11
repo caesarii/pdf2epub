@@ -13,10 +13,10 @@ import sys
 import argparse
 import base64
 import glob
-import html
 import json
 import re
 import time
+from html.parser import HTMLParser
 
 import fitz
 from ebooklib import epub
@@ -302,36 +302,547 @@ def _is_router_title(title: str) -> bool:
     return any(re.search(pattern, title) for pattern in patterns)
 
 
-def generate_router(output_dir: str) -> list[dict]:
-    entries = []
-    seen_titles = set()
-    seen_keys = set()
+def _router_key(title: str) -> str:
+    title = re.sub(r"<[^>]+>", "", title)
+    title = title.replace("｜", "|")
+    title = re.sub(r"^\|\s*", "", title)
+    title = re.sub(r"\s*\|\s*", "|", title)
+    title = title.replace("|", "")
+    title = re.sub(r"\s+", "", title)
+    title = title.replace("NO", "NO")
+    return title
+
+
+def _append_title_continuation(title: str, extra: str) -> str:
+    if not extra:
+        return title
+    max_overlap = min(len(title), len(extra))
+    for size in range(max_overlap, 0, -1):
+        if title.endswith(extra[:size]):
+            return title + extra[size:]
+    return title + extra
+
+
+def _normalize_toc_title(title: str, next_line: str = "") -> str | None:
+    title = title.strip().strip("*_` ")
+    if not title or title.startswith("目录"):
+        return None
+    title = re.sub(r"^\|\s*", "", title)
+    title = re.sub(r"\s*\|\s*", " | ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s+\d{1,3}$", "", title).strip()
+    if next_line and not _clean_heading(next_line):
+        extra = re.sub(r"\s+\d{1,3}$", "", next_line.strip()).strip()
+        if extra and len(extra) <= 12 and not re.search(r"[。！？；：]", extra):
+            title = _append_title_continuation(title, extra)
+    return title
+
+
+def _toc_display_title(title: str) -> str:
+    title = re.sub(r"\s+\d{1,3}$", "", title.strip()).strip()
+    return title
+
+
+def _extract_original_toc(output_dir: str) -> list[dict]:
+    toc_entries = []
+    in_toc = False
+    toc_anchor_added = False
     for path in _md_files(output_dir):
         page = _page_number_from_md(path)
         with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
-            if any((line.strip().lstrip("# ").strip().startswith("目录") for line in lines[:3])):
+        toc_heading_index = next(
+            (index for index, line in enumerate(lines[:3]) if line.strip().lstrip("# ").strip().startswith("目录")),
+            None,
+        )
+        if toc_heading_index is not None:
+            in_toc = True
+        if not in_toc:
+            continue
+        if toc_heading_index is not None and not toc_anchor_added:
+            toc_entries.append({
+                "title": "目录",
+                "level": 1,
+                "toc_page": page,
+                "toc_line": toc_heading_index,
+                "page": page,
+                "line": toc_heading_index,
+                "is_toc": True,
+            })
+            toc_anchor_added = True
+        for index, line in enumerate(lines):
+            heading = _clean_heading(line)
+            if not heading:
                 continue
-            for line_index, line in enumerate(lines):
-                heading = _clean_heading(line)
-                if not heading:
-                    continue
-                level, title = heading
-                if not _is_router_title(title):
-                    continue
-                key = re.sub(r"\s+", "", title.replace("｜", "|").replace(" ", ""))
-                # 同名或 OCR 空格差异标题只保留正文首次出现的位置。
-                if title in seen_titles or key in seen_keys:
-                    continue
-                seen_titles.add(title)
-                seen_keys.add(key)
-                entries.append({
-                    "title": title,
-                    "page": page,
-                    "line": line_index,
-                    "level": min(level, 2),
-                    "anchor": f"route-{len(entries) + 1:03d}",
-                })
+            level, title = heading
+            normalized = _normalize_toc_title(title, lines[index + 1] if index + 1 < len(lines) else "")
+            if not normalized:
+                continue
+            toc_entries.append({"title": normalized, "level": min(level, 2), "toc_page": page, "toc_line": index})
+        if in_toc and page > 24:
+            break
+    return toc_entries
+
+
+def _first_toc_page(output_dir: str) -> int | None:
+    for path in _md_files(output_dir):
+        page = _page_number_from_md(path)
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if any(line.strip().lstrip("# ").strip().startswith("目录") for line in lines[:3]):
+            return page
+    return None
+
+
+def _is_preface_router_title(title: str, level: int) -> bool:
+    title = title.strip()
+    if title.startswith("目录"):
+        return False
+    if level == 1:
+        return True
+    return title in {"编辑手记"}
+
+
+def _extract_preface_entries(output_dir: str) -> list[dict]:
+    first_toc_page = _first_toc_page(output_dir)
+    if first_toc_page is None:
+        return []
+    entries = []
+    for path in _md_files(output_dir):
+        page = _page_number_from_md(path)
+        if page >= first_toc_page:
+            break
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        for index, line in enumerate(lines):
+            heading = _clean_heading(line)
+            if not heading:
+                continue
+            level, title = heading
+            if not _is_preface_router_title(title, level):
+                continue
+            entries.append({
+                "title": title,
+                "page": page,
+                "line": index,
+                "level": min(level, 2),
+                "is_preface": True,
+            })
+    return entries
+
+
+def _toc_pages(output_dir: str) -> set[int]:
+    return {entry["toc_page"] for entry in _extract_original_toc(output_dir)}
+
+
+def _find_toc_target(output_dir: str, title: str) -> tuple[int, int, int] | None:
+    target_key = _router_key(title)
+    toc_pages = _toc_pages(output_dir)
+    for path in _md_files(output_dir):
+        page = _page_number_from_md(path)
+        if page in toc_pages:
+            continue
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if any(line.strip().lstrip("# ").strip().startswith("目录") for line in lines[:3]):
+            continue
+        for line_index, line in enumerate(lines):
+            heading = _clean_heading(line)
+            if not heading:
+                continue
+            level, candidate = heading
+            candidate_key = _router_key(candidate)
+            if candidate_key == target_key or candidate_key.startswith(target_key) or target_key.startswith(candidate_key):
+                return page, line_index, min(level, 2)
+    return None
+
+
+def _is_uncle_frank_heading(line: str) -> bool:
+    text = re.sub(r"^[#>*\-\s]+", "", line.strip()).strip("*_` ")
+    return bool(re.fullmatch(r"弗兰克叔叔[如是]*说……", text))
+
+
+def _normalize_uncle_frank_blocks(lines: list[str]) -> list[str]:
+    normalized = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith(">") or not _is_uncle_frank_heading(line):
+            normalized.append(line)
+            i += 1
+            continue
+
+        heading = re.sub(r"^[#>*\-\s]+", "", line.strip()).strip("*_` ")
+        normalized.append(f"> **{heading}**")
+        i += 1
+        while i < len(lines) and not lines[i].strip():
+            normalized.append(">")
+            i += 1
+        if i < len(lines) and not lines[i].lstrip().startswith(">"):
+            normalized.append(f"> {lines[i].strip()}")
+            i += 1
+        continue
+    return normalized
+
+
+def _render_latex_expression(expr: str) -> str:
+    expr = expr.strip()
+    expr = expr.replace(r"\,", " ")
+    expr = expr.replace(r"\%", "%")
+    expr = expr.replace(r"\$", "$")
+    expr = re.sub(
+        r"\\frac\{([^{}]+)\}\{([^{}]+)\}",
+        r'<span class="frac"><span class="num">\1</span><span class="den">\2</span></span>',
+        expr,
+    )
+    return expr
+
+
+def _render_math_blocks(html_content: str) -> str:
+    def repl(match: re.Match) -> str:
+        rendered = _render_latex_expression(match.group(1))
+        return f'<div class="math">{rendered}</div>'
+
+    html_content = re.sub(r"<p>\$\$(.*?)\$\$</p>", repl, html_content, flags=re.S)
+    return re.sub(
+        r"\$(\\frac\{.*?\}.*?[^\\])\$",
+        lambda match: f'<span class="inline-math">{_render_latex_expression(match.group(1))}</span>',
+        html_content,
+    )
+
+
+class LatinTextWrapper(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attr_text = "".join(f' {name}="{value}"' if value is not None else f" {name}" for name, value in attrs)
+        self.parts.append(f"<{tag}{attr_text}>")
+        if tag in {"script", "style"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag):
+        self.parts.append(f"</{tag}>")
+        if tag in {"script", "style"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_startendtag(self, tag, attrs):
+        attr_text = "".join(f' {name}="{value}"' if value is not None else f" {name}" for name, value in attrs)
+        self.parts.append(f"<{tag}{attr_text}/>")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            self.parts.append(data)
+            return
+        self.parts.append(re.sub(r"[A-Za-z0-9$][A-Za-z0-9.,:%+\-/$\s]*[A-Za-z0-9%]", r'<span class="latin">\g<0></span>', data))
+
+    def handle_entityref(self, name):
+        self.parts.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.parts.append(f"&#{name};")
+
+    def get_html(self) -> str:
+        return "".join(self.parts)
+
+
+def _wrap_latin_text(html_content: str) -> str:
+    parser = LatinTextWrapper()
+    parser.feed(html_content)
+    return parser.get_html()
+
+
+def _wrap_tables(html_content: str) -> str:
+    return re.sub(r"(<table>.*?</table>)", r'<div class="table-wrap">\1</div>', html_content, flags=re.S)
+
+
+def _mark_figure_paragraphs(html_content: str) -> str:
+    return re.sub(r"<p>([^<\n][^<]*\n)?(<img [^>]+/>)</p>", r'<p class="figure">\1\2</p>', html_content)
+
+
+def _mark_chapter_headings(html_content: str) -> str:
+    def repl(match):
+        anchor_id = match.group(1)
+        tag = match.group(2)
+        body = match.group(3)
+        return f'<{tag} id="{anchor_id}" class="chapter-title">{body}</{tag}>'
+
+    return re.sub(
+        r'<p><a id="([^"]+)" class="chapter-anchor"\s*(?:/>|></a>)</p>\s*<(h[1-6])>(.*?)</\2>',
+        repl,
+        html_content,
+        flags=re.S,
+    )
+
+
+FOOTNOTE_MARKS = "①②③④⑤⑥⑦⑧⑨⑩"
+
+
+def _inside_html_tag(html_content: str, index: int) -> bool:
+    return html_content.rfind("<", 0, index) > html_content.rfind(">", 0, index)
+
+
+def _inside_element(html_content: str, index: int, tag: str, class_name: str | None = None) -> bool:
+    start = html_content.rfind(f"<{tag}", 0, index)
+    end = html_content.rfind(f"</{tag}>", 0, index)
+    if start <= end:
+        return False
+    if class_name is None:
+        return True
+    tag_end = html_content.find(">", start, index)
+    if tag_end == -1:
+        return False
+    return class_name in html_content[start:tag_end]
+
+
+def _replace_last_footnote_ref(html_content: str, mark: str, replacement: str) -> str:
+    candidates = []
+    for match in re.finditer(re.escape(mark), html_content):
+        index = match.start()
+        if _inside_html_tag(html_content, index):
+            continue
+        if _inside_element(html_content, index, "sup", "footnote-ref"):
+            continue
+        if _inside_element(html_content, index, "p", "footnote"):
+            continue
+        candidates.append(index)
+    if not candidates:
+        return html_content
+    index = candidates[-1]
+    return html_content[:index] + replacement + html_content[index + len(mark):]
+
+
+def _inline_footnotes(html_content: str) -> str:
+    note_pattern = re.compile(
+        rf"<p>([{FOOTNOTE_MARKS}])\s*(.*?——(?:译者|编者)注)(.*?)</p>",
+        re.S,
+    )
+    result = html_content
+
+    while True:
+        match = note_pattern.search(result)
+        if not match:
+            break
+        mark = match.group(1)
+        body = match.group(2).strip()
+        rest = match.group(3).strip()
+        note_html = f'<sup class="footnote-ref">{mark}</sup><span class="inline-note">{body}</span>'
+        before = _replace_last_footnote_ref(result[:match.start()], mark, note_html)
+        after = result[match.end():]
+        if rest:
+            after = f"\n<p>{rest}</p>" + after
+        result = before + after
+    return result
+
+
+def _should_join_pages(previous: str, current: str) -> bool:
+    if not previous or not current:
+        return False
+    previous_line = previous.rstrip().splitlines()[-1].strip()
+    current_line = current.lstrip().splitlines()[0].strip()
+    if not previous_line or not current_line:
+        return False
+    if previous_line.startswith("#"):
+        return False
+    if current_line.startswith((">", "|", "- ", "* ")):
+        return False
+    if current_line.startswith("#"):
+        heading = re.sub(r"^#+\s*", "", current_line).strip()
+        return bool(heading and len(heading) <= 30 and not re.match(r"^(第\s*\d+\s*章|推荐序|中文版序|序言|附录|译后记)", heading))
+    if previous_line.endswith(("。", "！", "？", "：", "；", ".”", "。")):
+        return False
+    if re.match(r"^[，。！？；：、）】》〉」』,.!?;:]", current_line):
+        return True
+    if re.search(r"[\u4e00-\u9fffA-Za-z0-9]$", previous_line) and re.match(r"^[\u4e00-\u9fffA-Za-z0-9]", current_line):
+        return True
+    return False
+
+
+def _strip_leading_heading_marker(text: str) -> str:
+    return re.sub(r"^\s*#{1,6}\s+", "", text, count=1)
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return bool(cells) and all(re.match(r"^:?-{3,}:?$", cell) for cell in cells)
+
+
+def _is_table_row(line: str) -> bool:
+    return line.lstrip().startswith("|") and line.rstrip().endswith("|")
+
+
+def _last_table_width(lines: list[str]) -> int:
+    for line in reversed(lines):
+        if _is_table_row(line):
+            return len(line.strip().strip("|").split("|"))
+        if line.strip():
+            return 0
+    return 0
+
+
+def _table_width(line: str) -> int:
+    return len(line.strip().strip("|").split("|"))
+
+
+def _figure_caption(line: str) -> str | None:
+    text = line.strip()
+    if re.match(r"^图\s*\d+[—-]\d+\s+\S", text):
+        return text
+    return None
+
+
+def _is_noise_line(line: str) -> bool:
+    text = re.sub(r"\s+", "", line.strip())
+    watermarks = {
+        "好学近乎知",
+        "好学近知",
+        "張爰之印",
+        "张爰之印",
+    }
+    if text in watermarks:
+        return True
+    if "好学" in text and ("近知" in text or "近乎知" in text):
+        return True
+    return "空白页" in text and "印章" in text
+
+
+def _is_blank_stamp_page(lines: list[str]) -> bool:
+    text = "".join(re.sub(r"\s+", "", line) for line in lines)
+    if "好学" in text and ("近知" in text or "近乎知" in text):
+        return True
+    return "空白页" in text and ("印章" in text or "无文字内容" in text or "无可见文字内容" in text)
+
+
+def _epub_image_name(image_path: str) -> str:
+    return f"images/{os.path.basename(image_path)}"
+
+
+def _drop_trailing_fenced_block(lines: list[str]) -> bool:
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[-1].strip() != "```":
+        return False
+    lines.pop()
+    while lines:
+        line = lines.pop()
+        if line.strip() == "```":
+            break
+    return True
+
+
+def _trim_figure_ocr_before_caption(lines: list[str]) -> None:
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if _drop_trailing_fenced_block(lines):
+        return
+
+    tail = []
+    while lines:
+        text = lines[-1].strip()
+        if not text:
+            lines.pop()
+            continue
+        if text.startswith("<a id="):
+            break
+        if re.search(r"[。！？；：]$", text):
+            break
+        tail.append(lines.pop())
+        if len(tail) >= 12:
+            break
+
+    if tail:
+        compact = "".join(line.strip() for line in tail)
+        if len(tail) == 1 and len(compact) > 60:
+            lines.extend(reversed(tail))
+            return
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return
+
+    while lines:
+        text = lines[-1].strip()
+        if text and len(text) <= 42 and not re.search(r"[。！？；：]$", text):
+            lines.pop()
+            continue
+        break
+
+
+def _merge_continued_tables(md_text: str) -> str:
+    lines = md_text.splitlines()
+    result = []
+    i = 0
+    while i < len(lines):
+        marker = lines[i].strip().strip("*").strip()
+        if marker != "续前表":
+            result.append(lines[i])
+            i += 1
+            continue
+
+        i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+
+        # Some OCR pages repeat the table caption before the continued rows.
+        skipped_caption = False
+        if i < len(lines) and not _is_table_row(lines[i]):
+            next_non_empty = i + 1
+            while next_non_empty < len(lines) and not lines[next_non_empty].strip():
+                next_non_empty += 1
+            if next_non_empty < len(lines) and _is_table_row(lines[next_non_empty]):
+                i = next_non_empty
+                skipped_caption = True
+
+        previous_width = _last_table_width(result)
+        if i >= len(lines) or not _is_table_row(lines[i]):
+            continue
+
+        # Keep the previous table and continued rows contiguous for Markdown.
+        while result and not result[-1].strip():
+            result.pop()
+
+        if i + 1 < len(lines) and _is_table_separator(lines[i + 1]):
+            i += 2
+        elif skipped_caption and previous_width and _table_width(lines[i]) != previous_width:
+            result.append("")
+
+        while i < len(lines) and _is_table_row(lines[i]):
+            result.append(lines[i])
+            i += 1
+    return "\n".join(result)
+
+
+def generate_router(output_dir: str) -> list[dict]:
+    entries = []
+    seen_keys = set()
+    router_sources = _extract_preface_entries(output_dir) + _extract_original_toc(output_dir)
+    for toc_entry in router_sources:
+        key = _router_key(toc_entry["title"])
+        if key in seen_keys:
+            continue
+        if toc_entry.get("is_preface"):
+            page, line_index, level = toc_entry["page"], toc_entry["line"], toc_entry["level"]
+        elif toc_entry.get("is_toc"):
+            page, line_index, level = toc_entry["page"], toc_entry["line"], toc_entry["level"]
+        else:
+            target = _find_toc_target(output_dir, toc_entry["title"])
+            if not target:
+                continue
+            page, line_index, level = target
+        seen_keys.add(key)
+        entry = {
+            "title": toc_entry["title"],
+            "page": page,
+            "line": line_index,
+            "level": min(toc_entry.get("level") or level, 2),
+            "anchor": f"route-{len(entries) + 1:03d}",
+        }
+        if "toc_page" in toc_entry and "toc_line" in toc_entry:
+            entry["toc_page"] = toc_entry["toc_page"]
+            entry["toc_line"] = toc_entry["toc_line"]
+        entries.append(entry)
     return entries
 
 
@@ -347,15 +858,14 @@ def load_router(output_dir: str) -> list[dict]:
         return json.load(f)
 
 
-def cmd_router(args):
-    entries = generate_router(args.output_dir)
-    output = args.output or router_path(args.output_dir)
+def write_router(output_dir: str) -> list[dict]:
+    entries = generate_router(output_dir)
+    output = router_path(output_dir)
     with open(output, "w", encoding="utf-8") as f:
         json.dump(entries, f, ensure_ascii=False, indent=2)
         f.write("\n")
     print(f"[+] 已生成目录: {output}")
-    for entry in entries:
-        print(f"    p{entry['page']:04d} {entry['title']} -> #{entry['anchor']}")
+    return entries
 
 
 def cmd_build(args):
@@ -364,23 +874,69 @@ def cmd_build(args):
         print(f"[!] 未找到 md/page_*.md 文件")
         sys.exit(1)
 
-    routes = load_router(args.output_dir)
+    routes = write_router(args.output_dir)
     route_by_source = {(entry["page"], entry["line"]): entry for entry in routes}
+    toc_link_by_source = {
+        (entry["toc_page"], entry["toc_line"]): entry
+        for entry in routes
+        if "toc_page" in entry and "toc_line" in entry
+    }
     full_md = ""
+    figure_images = []
     for path in md_files:
         page = _page_number_from_md(path)
         with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
+        if _is_blank_stamp_page(lines):
+            continue
+        lines = _normalize_uncle_frank_blocks(lines)
         content_lines = []
+        skip_fence = False
         for line_index, line in enumerate(lines):
             if line.startswith("<!--"):
                 continue
+            if _is_noise_line(line):
+                continue
+            if skip_fence:
+                if line.strip() == "```":
+                    skip_fence = False
+                continue
             route = route_by_source.get((page, line_index))
             if route:
-                content_lines.append(f'<a id="{route["anchor"]}"></a>')
+                content_lines.append(f'<a id="{route["anchor"]}" class="chapter-anchor"></a>')
+            toc_route = toc_link_by_source.get((page, line_index))
+            if toc_route:
+                heading = _clean_heading(line)
+                if heading:
+                    display_title = _toc_display_title(heading[1])
+                    if toc_route["title"] == "目录":
+                        hashes = "#" * heading[0]
+                        line = f'{hashes} <a class="toc-link" href="#{toc_route["anchor"]}">{display_title}</a>'
+                    else:
+                        line = f'<p class="toc-item toc-level-{toc_route["level"]}"><a class="toc-link" href="#{toc_route["anchor"]}">{display_title}</a></p>'
+            caption = _figure_caption(line)
+            if caption:
+                _trim_figure_ocr_before_caption(content_lines)
+                if content_lines and content_lines[-1].strip():
+                    content_lines.append("")
             content_lines.append(line)
-        content = "\n".join(content_lines)
-        full_md += content.strip() + "\n\n"
+            if caption:
+                image_path = os.path.join(args.output_dir, "images", f"page_{page:04d}.png")
+                if os.path.exists(image_path):
+                    epub_name = _epub_image_name(image_path)
+                    figure_images.append((image_path, epub_name))
+                    content_lines.append("")
+                    content_lines.append(f'![{caption}]({epub_name})')
+                    next_index = line_index + 1
+                    while next_index < len(lines) and not lines[next_index].strip():
+                        next_index += 1
+                    if next_index < len(lines) and lines[next_index].strip() == "```":
+                        skip_fence = True
+        content = "\n".join(content_lines).strip()
+        if _should_join_pages(full_md, content):
+            full_md = full_md.rstrip() + _strip_leading_heading_marker(content).lstrip() + "\n\n"
+        else:
+            full_md += content + "\n\n"
 
     title = args.title or os.path.basename(args.output_dir)
     cover_path = os.path.join(args.output_dir, "cover.png")
@@ -397,9 +953,167 @@ def cmd_build(args):
             book.set_cover("cover.png", f.read())
 
     import markdown as md_lib
+    full_md = _merge_continued_tables(full_md)
     html_content = md_lib.markdown(full_md, extensions=["tables", "fenced_code"])
+    html_content = _render_math_blocks(html_content)
+    html_content = _wrap_latin_text(html_content)
+    html_content = _wrap_tables(html_content)
+    html_content = _mark_figure_paragraphs(html_content)
+    html_content = _mark_chapter_headings(html_content)
+    html_content = _inline_footnotes(html_content)
+    style = epub.EpubItem(
+        uid="book-style",
+        file_name="style/book.css",
+        media_type="text/css",
+        content="""
+p {
+  text-indent: 2em;
+  margin: 0.35em 0;
+  line-height: 1.85;
+}
+h1, h2, h3, h4, h5, h6 {
+  text-indent: 0;
+}
+a.toc-link {
+  color: inherit;
+  text-decoration: none;
+}
+.toc-item {
+  text-indent: 0;
+  margin: 0.8em 0 0.25em;
+  line-height: 1.45;
+}
+.toc-level-1 {
+  font-size: 1.18em;
+  font-weight: 700;
+}
+.toc-level-2 {
+  font-size: 1.05em;
+  font-weight: 650;
+  margin-left: 1em;
+}
+.chapter-title {
+  break-before: page;
+  page-break-before: always;
+  margin-top: 0;
+}
+.chapter-title:first-child {
+  break-before: auto;
+  page-break-before: auto;
+}
+blockquote {
+  margin: 1.2em 2.4em;
+  padding: 0.8em 1.2em;
+  border-left: 0.18em dotted #666;
+  border-right: 0.18em dotted #666;
+  font-family: 'Kaiti SC', 'STKaiti', 'KaiTi', serif;
+  font-weight: 600;
+  line-height: 1.9;
+}
+blockquote p,
+li p,
+td p,
+th p,
+.table-wrap p,
+.math,
+.figure {
+  text-indent: 0;
+}
+.footnote-ref {
+  font-size: 0.72em;
+  line-height: 0;
+  vertical-align: super;
+}
+.inline-note {
+  display: inline;
+  margin-left: 0.15em;
+  font-size: 0.86em;
+  color: #4f4a43;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  margin: 0;
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  font-size: 0.72em;
+  line-height: 1.5;
+  table-layout: auto;
+}
+th, td {
+  border: 1px solid #cfc8bb;
+  padding: 0.38em 0.55em;
+  vertical-align: top;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+th {
+  background: #efe7d8;
+  color: #2f261f;
+  font-weight: 700;
+}
+tbody tr:nth-child(even) td {
+  background: #fbf8f1;
+}
+.table-wrap {
+  margin: 1.1em 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.8em auto 1.2em;
+}
+.latin {
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  font-size: 0.88em;
+}
+.math {
+  margin: 1em 0;
+  text-align: center;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 0.9em;
+  line-height: 1.8;
+}
+.inline-math {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 0.9em;
+}
+.frac {
+  display: inline-block;
+  vertical-align: middle;
+  text-align: center;
+  line-height: 1.15;
+}
+.frac .num {
+  display: block;
+  padding: 0 0.25em 0.08em;
+  border-bottom: 1px solid currentColor;
+}
+.frac .den {
+  display: block;
+  padding: 0.08em 0.25em 0;
+}
+""".strip(),
+    )
+    book.add_item(style)
+    seen_figure_images = set()
+    for image_path, epub_name in figure_images:
+        if epub_name in seen_figure_images:
+            continue
+        seen_figure_images.add(epub_name)
+        with open(image_path, "rb") as f:
+            book.add_item(epub.EpubItem(
+                uid=f"figure-{os.path.splitext(os.path.basename(image_path))[0]}",
+                file_name=epub_name,
+                media_type="image/png",
+                content=f.read(),
+            ))
     chapter = epub.EpubHtml(title=title, file_name="content.xhtml", lang="zh")
     chapter.content = f"<html><body>{html_content}</body></html>"
+    chapter.add_item(style)
     book.add_item(chapter)
     if routes:
         book.toc = [epub.Link(f"content.xhtml#{entry['anchor']}", entry["title"], entry["anchor"]) for entry in routes]
@@ -407,62 +1121,11 @@ def cmd_build(args):
         book.toc = [epub.Link("content.xhtml", title, "content")]
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ["nav", chapter]
+    book.spine = [chapter]
 
     output = args.output or os.path.join(args.output_dir, f"{title}.epub")
     epub.write_epub(output, book)
     print(f"[+] EPUB 已生成: {output}")
-
-
-def cmd_preview(args):
-    unpacked_dir = args.unpacked_dir
-    epub_dir = os.path.join(unpacked_dir, "EPUB")
-    content_path = os.path.join(epub_dir, "content.xhtml")
-    nav_path = os.path.join(epub_dir, "nav.xhtml")
-    if not os.path.exists(content_path):
-        print(f"[!] 未找到 EPUB/content.xhtml: {content_path}")
-        sys.exit(1)
-    if not os.path.exists(nav_path):
-        print(f"[!] 未找到 EPUB/nav.xhtml: {nav_path}")
-        sys.exit(1)
-
-    title = args.title or os.path.basename(os.path.abspath(unpacked_dir))
-    output = args.output or os.path.join(unpacked_dir, "index.html")
-    with open(nav_path, encoding="utf-8") as f:
-        nav_html = f.read()
-    toc_match = re.search(r"<ol>.*</ol>", nav_html, flags=re.S)
-    toc_html = toc_match.group(0) if toc_match else "<ol><li><a href=\"content.xhtml\">正文</a></li></ol>"
-    toc_html = toc_html.replace('href="content.xhtml', 'href="EPUB/content.xhtml')
-    toc_html = re.sub(r"<a ", '<a target="book" ', toc_html)
-    preview_html = f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>{html.escape(title)}</title>
-  <style>
-    html, body {{ margin: 0; height: 100%; font-family: Georgia, 'Songti SC', serif; }}
-    body {{ display: grid; grid-template-columns: 300px 1fr; background: #f7f3eb; }}
-    nav {{ overflow: auto; padding: 24px 20px; border-right: 1px solid #ddd3c2; background: #fffaf0; }}
-    nav h1 {{ margin: 0 0 18px; font-size: 20px; }}
-    nav ol {{ padding-left: 22px; line-height: 1.8; }}
-    nav a {{ color: #4b3522; text-decoration: none; }}
-    nav a:hover {{ text-decoration: underline; }}
-    iframe {{ width: 100%; height: 100vh; border: 0; background: white; }}
-  </style>
-</head>
-<body>
-  <nav>
-    <h1>{html.escape(title)}</h1>
-    <p><a href="EPUB/content.xhtml" target="book">打开正文开头</a></p>
-    {toc_html}
-  </nav>
-  <iframe name="book" src="EPUB/content.xhtml" title="正文"></iframe>
-</body>
-</html>
-"""
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(preview_html)
-    print(f"[+] 预览页已生成: {output}")
 
 
 def main():
@@ -495,15 +1158,6 @@ def main():
     p_build.add_argument("--author")
     p_build.add_argument("--output", "-o")
 
-    p_router = sub.add_parser("router", help="生成 EPUB 可导航目录 router.json")
-    p_router.add_argument("output_dir")
-    p_router.add_argument("--output", "-o", default=None)
-
-    p_preview = sub.add_parser("preview", help="为 EPUB 解包目录生成浏览器预览页")
-    p_preview.add_argument("unpacked_dir")
-    p_preview.add_argument("--title", default=None)
-    p_preview.add_argument("--output", "-o", default=None)
-
     args = parser.parse_args()
     if args.cmd == "ocr":
         cmd_ocr(args)
@@ -511,10 +1165,6 @@ def main():
         cmd_ocr_image(args)
     elif args.cmd == "screenshot":
         cmd_screenshot(args)
-    elif args.cmd == "router":
-        cmd_router(args)
-    elif args.cmd == "preview":
-        cmd_preview(args)
     else:
         cmd_build(args)
 
