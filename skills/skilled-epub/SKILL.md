@@ -1,11 +1,11 @@
 ---
 name: skilled-epub
-description: Use when converting scanned PDFs to EPUB through an incremental workflow: render PDF pages to screenshots, OCR screenshots to per-page Markdown with Kimi via Zode, review Markdown, and build EPUB output. Also use for single-page screenshot/OCR operations in this repository.
+description: Use when converting scanned PDFs to EPUB through an incremental workflow: render PDF pages to screenshots, OCR screenshots to per-page Markdown with Kimi via Zode, review Markdown, and build EPUB output. Also use for MOBI to EPUB conversion and single-page screenshot/OCR operations in this repository.
 ---
 
 # Skilled EPUB
 
-扫描版 PDF 转 EPUB 的增量工作流：截图 PDF 页面、用 Kimi OCR 为逐页 Markdown、人工审核后打包 EPUB。
+扫描版 PDF 转 EPUB 的增量工作流：截图 PDF 页面、用 Kimi OCR 为逐页 Markdown、人工审核后打包 EPUB。也支持通过 Calibre 将 MOBI 转为 EPUB。
 
 OCR 默认通过 Zode 中转调用 Kimi `kimi-k2.5`，Zode Key 从项目根目录 `./output/.env` 读取。
 
@@ -32,6 +32,9 @@ python skills/skilled-epub/scripts/scan_pdf_to_epub.py ocr-image output/书名/i
 
 # 阶段二：Markdown → EPUB
 python skills/skilled-epub/scripts/scan_pdf_to_epub.py build <output_dir> [--title "书名"] [--author "作者"]
+
+# MOBI → EPUB
+python skills/skilled-epub/scripts/scan_pdf_to_epub.py mobi2epub <input.mobi> [--output output/book.epub]
 ```
 
 ## 工作流

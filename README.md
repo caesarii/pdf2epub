@@ -44,6 +44,15 @@ ocr --all
 build
 ```
 
+### `mobi2epub`
+
+将 MOBI 电子书转换为 EPUB。
+
+```bash
+mobi2epub input/book.mobi
+mobi2epub input/book.mobi --output output/book.epub
+```
+
 
 
 ## License

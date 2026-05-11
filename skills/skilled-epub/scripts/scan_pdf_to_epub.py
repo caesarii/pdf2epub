@@ -5,6 +5,7 @@
 - ocr:        PDF 页面截图 → 逐页 Markdown（增量，缺截图时自动补图）
 - ocr-image:  单张图片 → Markdown
 - build:      Markdown → EPUB
+- mobi2epub:  MOBI → EPUB
 
 OCR 优先使用 Zode 中转 Kimi（读取 ./output/.env 中的 key），保留 Claude 和外部回调作为兼容模式。
 """
@@ -15,6 +16,8 @@ import base64
 import glob
 import json
 import re
+import shutil
+import subprocess
 import time
 from html.parser import HTMLParser
 
@@ -1128,6 +1131,30 @@ img {
     print(f"[+] EPUB 已生成: {output}")
 
 
+def cmd_mobi2epub(args):
+    converter = shutil.which("ebook-convert")
+    if not converter:
+        raise RuntimeError("未找到 ebook-convert，请先安装 Calibre 并确保 ebook-convert 在 PATH 中")
+
+    input_path = args.input_mobi
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"输入文件不存在: {input_path}")
+
+    output = args.output
+    if not output:
+        base, _ = os.path.splitext(input_path)
+        output = f"{base}.epub"
+
+    os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
+    cmd = [converter, input_path, output]
+    print(f"[*] 转换 MOBI 为 EPUB: {input_path} -> {output}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"MOBI 转 EPUB 失败，退出码: {exc.returncode}") from exc
+    print(f"[+] EPUB 已生成: {output}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="扫描版 PDF 转 EPUB（两阶段）")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1158,6 +1185,10 @@ def main():
     p_build.add_argument("--author")
     p_build.add_argument("--output", "-o")
 
+    p_mobi2epub = sub.add_parser("mobi2epub", help="MOBI → EPUB")
+    p_mobi2epub.add_argument("input_mobi")
+    p_mobi2epub.add_argument("--output", "-o", help="输出 EPUB 路径（默认与输入同名 .epub）")
+
     args = parser.parse_args()
     if args.cmd == "ocr":
         cmd_ocr(args)
@@ -1165,8 +1196,10 @@ def main():
         cmd_ocr_image(args)
     elif args.cmd == "screenshot":
         cmd_screenshot(args)
-    else:
+    elif args.cmd == "build":
         cmd_build(args)
+    else:
+        cmd_mobi2epub(args)
 
 
 if __name__ == "__main__":
