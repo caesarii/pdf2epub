@@ -30,3 +30,5 @@ debug_last_response.json
 .env
 output/
 input/
+files/*
+!files/.gitkeep
