@@ -343,7 +343,7 @@ def _inside_element(html_content: str, index: int, tag: str, class_name: str | N
     return class_name in html_content[start:tag_end]
 
 
-def _replace_last_footnote_ref(html_content: str, mark: str, replacement: str) -> str:
+def _replace_last_footnote_ref(html_content: str, mark: str, replacement: str) -> tuple[str, bool]:
     candidates = []
     for match in re.finditer(re.escape(mark), html_content):
         index = match.start()
@@ -353,34 +353,85 @@ def _replace_last_footnote_ref(html_content: str, mark: str, replacement: str) -
             continue
         if _inside_element(html_content, index, "p", "footnote"):
             continue
-        candidates.append(index)
+        start = index
+        end = index + len(mark)
+        if _inside_element(html_content, index, "sup"):
+            sup_start = html_content.rfind("<sup", 0, index)
+            sup_end = html_content.find("</sup>", index)
+            if sup_start != -1 and sup_end != -1:
+                start = sup_start
+                end = sup_end + len("</sup>")
+        candidates.append((start, end))
     if not candidates:
-        return html_content
-    index = candidates[-1]
-    return html_content[:index] + replacement + html_content[index + len(mark):]
+        return html_content, False
+    start, end = candidates[-1]
+    return html_content[:start] + replacement + html_content[end:], True
 
 
-def _inline_footnotes(html_content: str) -> str:
+def _split_footnote_body(body: str) -> tuple[str, str]:
+    match = re.search(r"(.*?——(?:译者|编者)注)(.+)$", body, re.S)
+    if not match:
+        return body.strip(), ""
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _strip_wrapping_note_span(body: str) -> str:
+    body = body.strip()
+    match = re.fullmatch(r'<span class="(?:kaiti|fangsong)">(.*?)</span>', body, re.S)
+    if match:
+        return match.group(1).strip()
+    return body
+
+
+def _append_chapter_footnote(chapter_html: str, note_index: int, mark: str, body: str, rest: str = "") -> str:
+    ref_id = f"footnote-ref-{note_index:03d}"
+    note_id = f"footnote-{note_index:03d}"
+    ref_html = f'<sup class="footnote-ref"><a id="{ref_id}" href="#{note_id}">{mark}</a></sup>'
+    chapter_html, replaced = _replace_last_footnote_ref(chapter_html, mark, ref_html)
+    if not replaced:
+        chapter_html += f"\n<p>{ref_html}</p>"
+    if rest:
+        chapter_html += f"\n<p>{rest}</p>"
+    note_html = (
+        f'<p class="endnote" id="{note_id}">'
+        f'<a href="#{ref_id}" class="endnote-backref">{mark}</a> {body}'
+        f'</p>'
+    )
+    if '<section class="chapter-endnotes">' in chapter_html:
+        return chapter_html.replace("</section>", f"\n{note_html}\n</section>", 1)
+    return chapter_html + f'\n<section class="chapter-endnotes"><h2>注释</h2>\n{note_html}\n</section>'
+
+
+def _chapter_endnotes(html_content: str) -> str:
     note_pattern = re.compile(
-        rf"<p>([{FOOTNOTE_MARKS}])\s*(.*?——(?:译者|编者)注)(.*?)</p>",
+        rf'<p(?:\s[^>]*)?>\s*(?:<span class="(?:kaiti|fangsong)">\s*)?(?:<sup(?:\s[^>]*)?>\s*)?([{FOOTNOTE_MARKS}])(?:\s*</sup>)?\s*(.*?)(?:\s*</span>)?\s*</p>',
         re.S,
     )
-    result = html_content
+    chapter_pattern = re.compile(r'<h1\b[^>]*class="[^"]*chapter-title[^"]*"[^>]*>.*?</h1>', re.S)
+    chapter_starts = [match.start() for match in chapter_pattern.finditer(html_content)]
+    if not chapter_starts or chapter_starts[0] != 0:
+        chapter_starts.insert(0, 0)
+    chapter_starts.append(len(html_content))
 
-    while True:
-        match = note_pattern.search(result)
-        if not match:
-            break
-        mark = match.group(1)
-        body = match.group(2).strip()
-        rest = match.group(3).strip()
-        note_html = f'<sup class="footnote-ref">{mark}</sup><span class="inline-note">{body}</span>'
-        before = _replace_last_footnote_ref(result[:match.start()], mark, note_html)
-        after = result[match.end():]
-        if rest:
-            after = f"\n<p>{rest}</p>" + after
-        result = before + after
-    return result
+    chapters = [html_content[chapter_starts[index]: chapter_starts[index + 1]] for index in range(len(chapter_starts) - 1)]
+    note_index = 0
+    processed_chapters: list[str] = []
+
+    for chapter_html in chapters:
+        while True:
+            match = note_pattern.search(chapter_html)
+            if not match:
+                break
+            note_index += 1
+            mark = match.group(1)
+            body, rest = _split_footnote_body(_strip_wrapping_note_span(match.group(2)))
+            before = chapter_html[:match.start()]
+            after = chapter_html[match.end():]
+            chapter_html = before + after
+            chapter_html = _append_chapter_footnote(chapter_html, note_index, mark, body, rest)
+        processed_chapters.append(chapter_html)
+
+    return "".join(processed_chapters)
 
 
 def _figure_caption(line: str) -> str | None:
@@ -458,9 +509,13 @@ def _starts_like_standalone_block(html_fragment: str) -> bool:
     return bool(re.match(r"^(第[一二三四五六七八九十百零〇]+[章节]|前言|序言|导言|补论|附录|参考文献|索引|目录)$", text))
 
 
+def _looks_like_footnote_paragraph(html_fragment: str) -> bool:
+    return bool(re.match(rf"\s*(?:<span class=\"(?:kaiti|fangsong)\">\s*)?(?:<sup(?:\s[^>]*)?>\s*)?[{FOOTNOTE_MARKS}]", html_fragment, re.S))
+
+
 def _merge_continued_paragraphs(page_fragments: list[tuple[int, str]]) -> str:
     html_parts: list[str] = []
-    paragraph_pattern = re.compile(r"<p(\s[^>]*)?>(.*?)</p>\s*$", re.S)
+    paragraph_pattern = re.compile(r"<p(\s[^>]*)?>(.*?)</p>", re.S)
 
     for _, fragment in page_fragments:
         fragment = fragment.strip()
@@ -471,7 +526,8 @@ def _merge_continued_paragraphs(page_fragments: list[tuple[int, str]]) -> str:
             continue
 
         previous = html_parts[-1]
-        previous_match = paragraph_pattern.search(previous)
+        previous_matches = list(paragraph_pattern.finditer(previous))
+        previous_match = previous_matches[-1] if previous_matches else None
         current_match = re.match(r"^\s*<p(\s[^>]*)?>(.*?)</p>", fragment, re.S)
         if (
             previous_match
@@ -480,6 +536,8 @@ def _merge_continued_paragraphs(page_fragments: list[tuple[int, str]]) -> str:
             and not (current_match.group(1) or "").strip()
             and not _ends_like_complete_sentence(previous_match.group(2))
             and not _starts_like_standalone_block(current_match.group(2))
+            and not _looks_like_footnote_paragraph(previous_match.group(2))
+            and not _looks_like_footnote_paragraph(current_match.group(2))
         ):
             merged_paragraph = f"<p>{previous_match.group(2).rstrip()}{current_match.group(2).lstrip()}</p>"
             html_parts[-1] = previous[: previous_match.start()] + merged_paragraph
@@ -643,7 +701,7 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
     full_html = _wrap_tables(full_html)
     full_html = _mark_figure_paragraphs(full_html)
     full_html = _mark_chapter_headings(full_html)
-    full_html = _inline_footnotes(full_html)
+    full_html = _chapter_endnotes(full_html)
     full_html = _add_heading_ids(full_html)
 
     book = epub.EpubBook()
@@ -829,10 +887,24 @@ th p,
   line-height: 0;
   vertical-align: super;
 }
-.inline-note {
-  display: inline;
-  margin-left: 0.15em;
+.footnote-ref a,
+.endnote-backref {
+  color: inherit;
+  text-decoration: none;
+}
+.chapter-endnotes {
+  break-before: page;
+  page-break-before: always;
+  margin-top: 1em;
+}
+.chapter-endnotes h2 {
+  font-size: 1.12em;
+  margin: 0 0 0.8em;
+}
+.endnote {
+  text-indent: 0;
   font-size: 0.86em;
+  line-height: 1.7;
   color: #4f4a43;
 }
 table {
