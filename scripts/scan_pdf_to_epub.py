@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 
@@ -34,6 +35,8 @@ import requests
 KIMI_ENDPOINT = "https://zode.qa.qima-inc.com/api/proxy/forward/chat/completions"
 KIMI_MODEL = "kimi-k2.5"
 FILES_DIR = "files"
+OCR_MAX_RETRIES = int(os.getenv("OCR_MAX_RETRIES", "3"))
+OCR_RETRY_BASE_DELAY = float(os.getenv("OCR_RETRY_BASE_DELAY", "1.5"))
 
 OCR_PROMPT = """请仔细识别这张扫描页面的内容，输出可直接放入 EPUB 正文的 HTML 片段。要求：
 1. 只输出 <h1>、<h2>、<h3>、<p>、<blockquote>、<ul>、<ol>、<li>、<table>、<thead>、<tbody>、<tr>、<th>、<td>、<sup>、<sub>、<em>、<strong>、<br> 等正文片段标签
@@ -178,17 +181,25 @@ def render_pages_to_images(pdf_path: str, start: int, end: int, image_dir: str) 
     doc = fitz.open(pdf_path)
     os.makedirs(image_dir, exist_ok=True)
     paths = []
+    created = 0
+    reused = 0
+    total = end - start
+    started = time.time()
     for page_num in range(start, end):
         path = os.path.join(image_dir, f"page_{page_num + 1:04d}.png")
         if not os.path.exists(path):
             page = doc.load_page(page_num)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             pix.save(path)
-            print(f"[+] 已截图: {path}")
+            created += 1
+            print(f"[+] 截图 {created + reused}/{total}: {path}")
         else:
-            print(f"[+] 跳过（已存在）: {path}")
+            reused += 1
+            print(f"[+] 复用 {created + reused}/{total}: {path}")
         paths.append(path)
     doc.close()
+    elapsed = time.time() - started
+    print(f"[*] 截图阶段完成：新建 {created} 页，复用 {reused} 页，耗时 {elapsed:.1f}s")
     return paths
 
 
@@ -593,8 +604,30 @@ def _read_cached_ocr(output_dir: str, image_path: str) -> str | None:
 def _write_cached_ocr(output_dir: str, image_path: str, html: str) -> None:
     cache_path = _ocr_cache_path(output_dir, image_path)
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(cache_path), prefix=".tmp-", suffix=".html")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(html)
+        os.replace(tmp_path, cache_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _ocr_image_to_html_with_retry(image_path: str, model: str | None = None) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, OCR_MAX_RETRIES + 1):
+        try:
+            return _ocr_image_to_html(image_path, model=model)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= OCR_MAX_RETRIES:
+                break
+            delay = OCR_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"[!] OCR 失败，重试 {attempt}/{OCR_MAX_RETRIES - 1}: {image_path} ({exc})，{delay:.1f}s 后重试")
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 def _ocr_uncached_pages(output_dir: str, image_paths: list[str], model: str | None = None, workers: int | None = None) -> None:
@@ -603,20 +636,31 @@ def _ocr_uncached_pages(output_dir: str, image_paths: list[str], model: str | No
         return
 
     workers = workers or int(os.getenv("OCR_WORKERS", "8"))
+    start_time = time.time()
     print(f"[*] 并发 OCR 待处理 {len(pending)} 页，workers={workers}")
     executor = ThreadPoolExecutor(max_workers=workers)
+    completed = 0
+    failed = 0
     try:
-        futures = {executor.submit(_ocr_image_to_html, path, model): path for path in pending}
+        futures = {executor.submit(_ocr_image_to_html_with_retry, path, model): path for path in pending}
         for future in as_completed(futures):
             path = futures[future]
-            html = future.result()
+            try:
+                html = future.result()
+            except Exception as exc:
+                failed += 1
+                print(f"[!] OCR 失败: {path} ({exc})")
+                continue
             _write_cached_ocr(output_dir, path, html)
-            print(f"[+] OCR 完成并缓存: {path}")
+            completed += 1
+            print(f"[+] OCR 完成并缓存 ({completed}/{len(pending)}): {path}")
     except KeyboardInterrupt:
         executor.shutdown(wait=False, cancel_futures=True)
         raise
     else:
         executor.shutdown(wait=True)
+    elapsed = time.time() - start_time
+    print(f"[*] OCR 阶段完成：成功 {completed} 页，失败 {failed} 页，耗时 {elapsed:.1f}s")
 
 
 def _page_images(output_dir: str) -> list[str]:
@@ -643,6 +687,7 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
         print(f"[!] 未找到 images/page_*.png 图片")
         sys.exit(1)
 
+    start_time = time.time()
     title = title or _default_title_from_output_dir(output_dir)
     output = output or os.path.join(output_dir, f"{title}.epub")
     os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
@@ -652,9 +697,19 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
     full_page_images: list[tuple[str, str]] = []
     ocr_needed_paths: list[str] = []
     full_page_fragments: dict[str, str] = {}
+    stats = {
+        "full_page_candidates": 0,
+        "ocr_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "blank_pages": 0,
+        "image_only_pages": 0,
+        "figure_pages": 0,
+    }
 
     for index, image_path in enumerate(image_paths, start=1):
         if _looks_like_full_page_image(image_path):
+            stats["full_page_candidates"] += 1
             epub_name = _epub_image_name(image_path)
             full_page_images.append((image_path, epub_name))
             full_page_fragments[image_path] = _full_page_image_fragment(epub_name)
@@ -662,6 +717,7 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
             continue
         ocr_needed_paths.append(image_path)
 
+    stats["ocr_requests"] = len(ocr_needed_paths)
     _ocr_uncached_pages(output_dir, ocr_needed_paths, model=model)
 
     for index, image_path in enumerate(image_paths, start=1):
@@ -672,23 +728,30 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
 
         fragment = _read_cached_ocr(output_dir, image_path)
         if fragment is None:
+            stats["cache_misses"] += 1
             print(f"[-] OCR 第 {index} 页: {image_path}")
-            fragment = _ocr_image_to_html(image_path, model=model)
+            fragment = _ocr_image_to_html_with_retry(image_path, model=model)
             _write_cached_ocr(output_dir, image_path, fragment)
         else:
+            stats["cache_hits"] += 1
             print(f"[+] OCR 缓存第 {index} 页: {image_path}")
         if not fragment:
             continue
         if _is_blank_stamp_page(fragment.splitlines()):
+            stats["blank_pages"] += 1
             continue
 
         if _is_image_only_page(fragment):
+            stats["image_only_pages"] += 1
             epub_name = _epub_image_name(image_path)
             full_page_images.append((image_path, epub_name))
             fragment = _full_page_image_fragment(epub_name)
             print(f"    -> 纯图页面，保留原图")
         else:
+            before_fragment = fragment
             fragment = _inject_figure_images(fragment, page_number, output_dir, figure_images)
+            if fragment != before_fragment:
+                stats["figure_pages"] += 1
         page_fragments.append((page_number, fragment))
 
     if not page_fragments:
@@ -749,6 +812,19 @@ def build_html_epub_from_images(output_dir: str, title: str | None = None, autho
     book.add_item(epub.EpubNav())
     book.spine = [chapter]
     epub.write_epub(output, book)
+    elapsed = time.time() - start_time
+    print(
+        "[*] 构建阶段完成："
+        f"页面 {len(image_paths)}，"
+        f"OCR 请求 {stats['ocr_requests']}，"
+        f"缓存命中 {stats['cache_hits']}，"
+        f"缓存未命中 {stats['cache_misses']}，"
+        f"纯图候选 {stats['full_page_candidates']}，"
+        f"纯图页 {stats['image_only_pages']}，"
+        f"图题页 {stats['figure_pages']}，"
+        f"空白/印章页 {stats['blank_pages']}，"
+        f"耗时 {elapsed:.1f}s"
+    )
     print(f"[+] EPUB 已生成: {output}")
     return output
 
@@ -990,6 +1066,7 @@ img {
 
 
 def cmd_screenshot(args):
+    started = time.time()
     output_dir = args.output_dir or _default_output_dir(args.input_pdf)
     image_dir = os.path.join(output_dir, "images")
     total = _get_pdf_total_pages(args.input_pdf)
@@ -1001,10 +1078,12 @@ def cmd_screenshot(args):
 
     print(f"[*] PDF 共 {total} 页，本次截图第 {start + 1}-{end} 页")
     render_pages_to_images(args.input_pdf, start, end, image_dir)
+    print(f"[*] 截图命令完成，耗时 {time.time() - started:.1f}s")
     print(f"[*] 截图完成: {image_dir}")
 
 
 def cmd_pdf2epub(args):
+    started = time.time()
     output_dir = args.output_dir or _default_output_dir(args.input_pdf)
     image_dir = os.path.join(output_dir, "images")
     total = _get_pdf_total_pages(args.input_pdf)
@@ -1017,13 +1096,17 @@ def cmd_pdf2epub(args):
     print(f"[*] PDF 共 {total} 页，本次转换第 {start + 1}-{end} 页")
     render_pages_to_images(args.input_pdf, start, end, image_dir)
     build_html_epub_from_images(output_dir, title=args.title, author=args.author, output=args.output, model=args.model)
+    print(f"[*] pdf2epub 命令完成，耗时 {time.time() - started:.1f}s")
 
 
 def cmd_build(args):
+    started = time.time()
     build_html_epub_from_images(args.output_dir, title=args.title, author=args.author, output=args.output, model=args.model)
+    print(f"[*] build 命令完成，耗时 {time.time() - started:.1f}s")
 
 
 def cmd_mobi2epub(args):
+    started = time.time()
     converter = shutil.which("ebook-convert")
     if not converter:
         raise RuntimeError("未找到 ebook-convert，请先安装 Calibre 并确保 ebook-convert 在 PATH 中")
@@ -1043,6 +1126,7 @@ def cmd_mobi2epub(args):
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"MOBI 转 EPUB 失败，退出码: {exc.returncode}") from exc
+    print(f"[*] mobi2epub 命令完成，耗时 {time.time() - started:.1f}s")
     print(f"[+] EPUB 已生成: {output}")
 
 
